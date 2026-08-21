@@ -470,6 +470,11 @@ def flatten_person(rec: dict) -> dict:
         return {}
     company = rec.get("current_company") or {}
     phones = rec.get("phones") or []
+    # is_dnd is real ACMA Do Not Call Register status — Firmable folds the register
+    # into their dataset. Split it out here so the distinction survives into a CSV
+    # instead of staying buried in a nested field, and a dialler can be pointed at
+    # `mobile` alone. It is the register as at Firmable's last refresh, so it is a
+    # point-in-time status rather than a live check.
     clean, dnd = [], []
     for p in phones:
         if isinstance(p, dict):
