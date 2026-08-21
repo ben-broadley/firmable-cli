@@ -1071,6 +1071,17 @@ BATCH_COMMANDS = {
     "roster": "people/search per company id, optionally enriched to full contact records",
 }
 
+# High-level commands over the MCP surface. These are what you want for volume:
+# they chunk to the 100-at-a-time bulk tools, rate limit, resume, and refuse to
+# spend credits without --yes.
+VOLUME_COMMANDS = {
+    "costs": "what spends credits and what does not (--json for agents)",
+    "search": "find companies or people — FREE",
+    "emails": "work + personal emails, 100 per call — FREE",
+    "profiles": "full person or company profiles — COSTS 1 CREDIT EACH",
+    "phones": "mobile numbers — COSTS 1 CREDIT EACH",
+}
+
 
 def cmd_commands(registry: dict) -> None:
     print("Endpoint commands (from openapi.json):")
@@ -1081,13 +1092,22 @@ def cmd_commands(registry: dict) -> None:
     print("\nBatch commands (CSV in, JSONL + CSV out, rate limited, resumable):")
     for name, desc in BATCH_COMMANDS.items():
         print(f"  {name:<{width}}  {desc}")
-    print("\nAlso: mcp (Firmable MCP tools over the CLI), commands, help <name>")
-    print("`firmable help <name>` for flags. Every lookup spends credits.")
+    print("\nVolume commands (MCP-backed, chunked to 100/call, rate limited, resumable):")
+    for name, desc in VOLUME_COMMANDS.items():
+        print(f"  {name:<{width}}  {desc}")
+    print("\nAlso: mcp (raw access to all 28 MCP tools), commands, help <name>")
+    print("\nSearching is free on both surfaces; only record retrieval spends.")
+    print("Run `firmable costs` for the full contract, or `firmable costs --json` for agents.")
 
 
 def cmd_help(registry: dict, command: str | None) -> None:
     if not command:
         sys.exit("usage: firmable help <command>")
+    if command in VOLUME_COMMANDS:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import firmable_bulk  # noqa: PLC0415
+        getattr(firmable_bulk, f"cmd_{command}")(["--help"])
+        return
     if command in BATCH_COMMANDS:
         if command == "roster":
             cmd_roster(["--help"])
@@ -1129,11 +1149,16 @@ def main() -> None:
         from firmable_mcp import main as mcp_main  # noqa: PLC0415 — optional module
         mcp_main(rest)
         return
+    if cmd in VOLUME_COMMANDS:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import firmable_bulk  # noqa: PLC0415 — optional module
+        getattr(firmable_bulk, f"cmd_{cmd}")(rest)
+        return
     if cmd in registry:
         run_endpoint(registry, cmd, rest)
         return
 
-    known = list(registry) + list(BATCH_COMMANDS) + ["mcp", "commands", "help"]
+    known = list(registry) + list(BATCH_COMMANDS) + list(VOLUME_COMMANDS) + ["mcp", "commands", "help"]
     suggestions = difflib.get_close_matches(cmd, known, n=3, cutoff=0.5)
     msg = f"unknown command: {cmd}"
     if suggestions:

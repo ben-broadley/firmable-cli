@@ -23,6 +23,11 @@ Two files and a spec. No dependencies, Python 3.9 or newer.
   Cursor. `firmable mcp` speaks the protocol directly, so the same tools work in a terminal,
   a cron job, or anything that can shell out.
 
+> **Agents: read [AGENTS.md](AGENTS.md) first, or run `firmable costs --json`.**
+> Searching is free and only record retrieval spends. The paid endpoints are the
+> ones you will reach for out of habit — a session here burned ~20 credits on REST
+> company lookups right after printing the table showing search was free.
+
 ## Which half should I use?
 
 The CLI covers two different Firmable surfaces, and they are not equivalent. If you have MCP
@@ -277,6 +282,31 @@ people you actually want phone numbers for.**
 Repeat fetches are deduped per profile, so re-running a job is safe. Batch commands also resume
 from their JSONL by default, which is the main defence against paying twice; `--force` is the
 only way to override it.
+
+### Rate limits
+
+Limits are **per tool bucket**, and they are not uniform:
+
+| Bucket | Behaviour |
+| --- | --- |
+| Search (`ai_search`, `filter_search`, REST `people-search`) | no throttling at 64 concurrent / 31 req/s across ~450 calls |
+| Bulk enrichment (`bulk_reveal_person_emails`) | throttled after a couple of calls; retry hints of 21s and 60s, so roughly **100 records per 20–60s** sustained |
+
+**A throttled call returns HTTP 200 with the error in the body:**
+
+```json
+{"success": false, "code": "rate_limited", "error": "... Retry in 36s.", "status": 429}
+```
+
+A client that only checks the HTTP status records that as a success and **silently
+drops every record in the chunk**. That happened on the first run here — 250 people
+in, 200 rows out, nothing flagged. `firmable emails` and `firmable phones` detect it
+and honour the retry hint, which is the main reason to use them rather than looping
+over `firmable mcp call` yourself.
+
+Defaults are 5 req/s over 4 workers, deliberately below what the server permits.
+Sustained load from a named account is how you get a limit imposed. Since the bulk
+tools take 100 records per call, a slow request rate still moves plenty.
 
 ### You cannot read your balance programmatically
 
