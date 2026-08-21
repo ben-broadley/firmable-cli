@@ -1,10 +1,37 @@
 """firmable mcp — drive the Firmable MCP server from the shell.
 
-Firmable ships an MCP server (agents.firmable.com/mcp) whose tool set is richer
-than the three documented REST endpoints. Normally you would only reach it from
-inside an MCP client (Claude, ChatGPT, Cursor). This module speaks the protocol
-directly — Streamable HTTP + JSON-RPC — so the same tools are available from a
-terminal, a cron job, or any script that can shell out.
+Firmable ships an MCP server (agents.firmable.com/mcp) with 28 tools — a much
+larger surface than the three documented REST endpoints. Normally you would only
+reach it from inside an MCP client (Claude, ChatGPT, Cursor). This module speaks
+the protocol directly — Streamable HTTP + JSON-RPC — so the same tools are
+available from a terminal, a cron job, or any script that can shell out.
+
+Why it beats the REST API for most work:
+  * It can SEARCH. filter_search / ai_search discover records by industry,
+    location, size, seniority and so on, for free. Every REST endpoint needs an
+    identifier you already hold, so REST enriches but never finds.
+  * Work emails are FREE. reveal_person_email / bulk_reveal_person_emails cost
+    nothing; REST /people charges a credit for a record carrying the same
+    address.
+  * Bulk means 100 profiles per call, against one HTTP request per row on REST.
+
+Credit costs, measured against a live account rather than quoted:
+  free ...... all search, email reveals, lists, signals, filter options,
+              misses, and re-fetching a record already bought
+  1 credit .. get_company / get_person / bulk_get_*, reveal_person_phone /
+              bulk_reveal_person_phones, push_to_crm
+So: search free -> reveal emails free -> spend only on phones. If you do need a
+phone, prefer get_person over reveal_person_phone: same one credit, but it
+returns the profile and email too.
+
+Call get_workflow_guide first in a session — it documents the intended chain
+(get_* -> find_similar_* -> bulk_* -> reveal_*) and the filter encoding rules,
+which are fiddly enough that guessing them wastes calls. Prefer filter_search
+over ai_search; the latter parses loosely.
+
+Credit-charging tools run IMMEDIATELY with no in-tool approval gate, and
+bulk_reveal_person_phones is atomic — a batch larger than the balance is
+rejected whole rather than partially filled.
 
     firmable mcp login              # one-time browser sign-in (OAuth 2.1 + PKCE)
     firmable mcp status             # who you are signed in as, token expiry

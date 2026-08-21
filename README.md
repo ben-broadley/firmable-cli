@@ -103,8 +103,9 @@ firmable roster companies.csv --enrich --only-contactable --csv people.csv
 already in it. Kill a job halfway through a 40,000-row list and start it again; it picks up
 where it stopped and you pay for nothing twice. `--force` overrides.
 
-**It costs what you'd expect.** One credit per row that hits, nothing for a miss. `roster` is
-the exception — see [Credits](#credits) before pointing it at large companies.
+**It only charges for records.** One credit per row that hits, nothing for a miss, nothing for
+the searching. `roster` lists everyone at a company for free — only `--enrich` spends, at one
+credit per person, so `--only-contactable` is doing real work.
 
 **It stays inside the rate limit.** Firmable allows 50 requests per second per key. The
 default is 20 across 8 threads, tunable with `--rps` and `--concurrency`, and the CLI refuses
@@ -195,18 +196,21 @@ guidance is to prefer `filter_search`: it is more precise, and `ai_search` runs 
 natural-language parsing server-side. Resolve option ids with `get_filter_options` first rather
 than guessing them.
 
-**Emails are free here.** `reveal_person_email` and `bulk_reveal_person_emails` are documented
-as not credit-gated, where the REST `/people` endpoint charges a credit for a record containing
-the same address. If you want work emails at volume, this is the cheaper path by a wide margin.
-Phones still cost a credit either way.
+**Emails are free here.** `reveal_person_email` and `bulk_reveal_person_emails` cost nothing —
+confirmed against a live balance — where the REST `/people` endpoint charges a credit for a
+record containing the same address. If you want work emails at volume, this is the cheaper path
+by a wide margin. Phones still cost a credit either way.
+
+MCP phone records are also richer: `is_mobile`, `is_verified`, `is_primary` and `is_personal`
+alongside `is_dnd`, so you can separate mobiles from landlines. REST gives you neither.
 
 **Bulk means bulk.** `bulk_get_people` and `bulk_reveal_person_emails` take up to 100 profiles
 per call. The REST batch commands in this CLI issue one HTTP request per row because that is all
 the REST API offers.
 
-Costs above are Firmable's own per-tool declarations. Credits are drawn from separate pools —
-`api_enrichment`, `people_phone_viewed`, `crm_push` — so a phone budget and an enrichment budget
-run down independently.
+Those costs are measured, not quoted — see [Credits](#credits). Firmable draws them from
+separate pools (`api_enrichment`, `people_phone_viewed`, `crm_push`), so a phone budget and an
+enrichment budget run down independently.
 
 Two behaviours worth knowing before you point an agent at this: credit-charging tools **run
 immediately, with no confirmation step**, and `bulk_reveal_person_phones` is atomic, so a batch
@@ -273,6 +277,25 @@ people you actually want phone numbers for.**
 Repeat fetches are deduped per profile, so re-running a job is safe. Batch commands also resume
 from their JSONL by default, which is the main defence against paying twice; `--force` is the
 only way to override it.
+
+### You cannot read your balance programmatically
+
+There is no credits endpoint on the REST API, no usage tool among the 28 MCP tools, and no
+usage metadata on any response — REST returns no credit headers, and the MCP envelope carries
+only `content`, `structuredContent` and `isError`. The only place a balance appears is the
+Firmable web app.
+
+Two consequences if you are scripting this:
+
+- **A run cannot check its own budget before spending.** Bound it up front instead — `--limit`,
+  `--per-company`, `--only-contactable` — rather than expecting it to stop itself.
+- **You find out you are empty by failing.** Phone reveals return `code="no_credits"`, and
+  `bulk_reveal_person_phones` is atomic, so a batch larger than the remaining balance is
+  rejected whole rather than partially filled. Handle that error rather than assuming a partial
+  result.
+
+This is also why the costs in this README were measured by watching the balance across single
+calls. There was no other way to establish them.
 
 ## Licence
 
