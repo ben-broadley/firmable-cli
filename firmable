@@ -1,0 +1,1131 @@
+#!/usr/bin/env python3
+"""firmable — unofficial CLI over the Firmable REST API.
+
+Not affiliated with, endorsed by, or sponsored by Firmable.
+
+Firmable is the AU/NZ B2B sales-intelligence database (~1.5M companies, ~10M
+people) carrying ABN/ACN/NZBN, ANZSIC, technographics, work emails and mobiles.
+This CLI covers every documented operation in the OpenAPI spec sitting next to
+this script (openapi.json, from docs.firmable.com), and adds batch commands that
+run a CSV through those endpoints with rate limiting, retries and resume.
+
+Set FIRMABLE_API_KEY in your environment. JSON is written to stdout.
+
+Quick start:
+  export FIRMABLE_API_KEY=fbl_...
+  ./firmable commands                         # list every available command
+  ./firmable help company                     # show args/flags for one command
+  ./firmable company --fqdn smec.com
+  ./firmable company --abn 47065475149 --csv smec.csv
+  ./firmable people --ln-url https://www.linkedin.com/in/some-slug/
+  ./firmable people-search --company-id f000000147616 --seniority C-Suite --all
+  ./firmable company-batch domains.csv --by fqdn --csv enriched.csv
+  ./firmable people-batch profiles.csv --by ln_url --csv contacts.csv
+  ./firmable roster companies.csv --column id --enrich --csv people.csv
+
+Auth: a bearer token in the Authorization header. Create the key at
+app.firmable.com -> Profile -> Integrations -> API. Keys start with `fbl_`.
+
+Rate limit: 50 requests/second per API key. Batch commands default to 20 rps
+across 8 worker threads; raise with --rps / --concurrency at your own risk.
+
+Credits: every successful lookup consumes Firmable credits. Batch commands
+resume from their JSONL output by default, so a re-run never re-buys a row you
+already have — pass --force to override. --dry-run prints the request without
+sending it.
+
+Where the spec lies (handled here, so you don't have to):
+  * A lookup miss returns HTTP 500 {"error":"Company profile not found"}, not a
+    404. Misses are recorded as misses and never retried.
+  * POST /people/search 307-redirects to an internal URL; the redirect must be
+    replayed with the method and body intact.
+  * /people/search returns {"records":[...],"total":N}, not the bare array the
+    spec documents. --all pages on `total`.
+
+Global flags:
+  --version, -V    show CLI version
+  --help, -h       show this help
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import difflib
+import json
+import keyword
+import os
+import re
+import socket
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+VERSION = "0.1.0"
+SPEC_PATH = Path(__file__).resolve().parent / "openapi.json"
+BASE_URL = "https://api.firmable.com"
+API_KEY_ENV = "FIRMABLE_API_KEY"
+USER_AGENT = f"firmable-cli/{VERSION}"
+
+RATE_LIMIT_CEILING = 50      # documented: 50 requests/second per API key
+DEFAULT_RPS = 20
+DEFAULT_CONCURRENCY = 8
+DEFAULT_PAGE_SIZE = 100
+MAX_REDIRECTS = 5
+
+# Firmable answers a lookup miss with a 500, not a 404. Retrying those wastes
+# four extra calls per miss, so match the message and stop.
+MISS_MARKERS = ("not found", "no profile", "no record")
+
+METHODS = ("get", "post", "put", "patch", "delete")
+
+
+# ---------------------------------------------------------------------------
+# errors
+# ---------------------------------------------------------------------------
+
+class ApiError(Exception):
+    """An HTTP or transport failure against the Firmable API."""
+
+    def __init__(self, status: int | None, message: str, url: str = "", miss: bool = False):
+        self.status = status
+        self.message = message
+        self.url = url
+        self.miss = miss
+        super().__init__(f"HTTP {status}: {message}" if status else message)
+
+
+class AuthError(ApiError):
+    """The API key was rejected — never worth retrying, and fatal in batch."""
+
+
+# ---------------------------------------------------------------------------
+# spec -> command registry
+# ---------------------------------------------------------------------------
+
+def slugify(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
+
+
+def _dest_for(name: str) -> str:
+    d = re.sub(r"\W", "_", name)
+    if keyword.iskeyword(d) or not d.isidentifier():
+        d += "_"
+    return d
+
+
+def _flag_names(name: str) -> list[str]:
+    """Offer both the spec spelling and a dashed alias (--ln_slug / --ln-slug)."""
+    flags = [f"--{name}"]
+    dashed = "--" + re.sub(r"(?<!^)(?=[A-Z])", "-", name).replace("_", "-").lower()
+    if dashed not in flags:
+        flags.append(dashed)
+    return flags
+
+
+def load_spec() -> dict:
+    if not SPEC_PATH.exists():
+        sys.exit(f"openapi.json not found next to this script ({SPEC_PATH})")
+    with SPEC_PATH.open() as f:
+        return json.load(f)
+
+
+def _extract_body_schema(op: dict) -> dict | None:
+    rb = op.get("requestBody")
+    if not rb:
+        return None
+    schema = ((rb.get("content") or {}).get("application/json") or {}).get("schema")
+    if not schema:
+        return None
+    return {
+        "required_top": list(schema.get("required") or []),
+        "properties": dict(schema.get("properties") or {}),
+    }
+
+
+def build_registry(spec: dict) -> dict:
+    """Map command name -> operation metadata for every operation in the spec.
+
+    Names come from the path (/people/search -> people-search) rather than the
+    description, because Firmable's spec carries no summary or operationId.
+    """
+    registry: dict = {}
+    for path, methods in spec.get("paths", {}).items():
+        path_level = methods.get("parameters", []) or []
+        for method in METHODS:
+            op = methods.get(method)
+            if not op:
+                continue
+            op_level = op.get("parameters", []) or []
+            seen = {p["name"] for p in op_level}
+            params = op_level + [p for p in path_level if p["name"] not in seen]
+            name = slugify(path.strip("/")) or "root"
+            if name in registry:
+                name = f"{method}-{name}"
+            base, i = name, 2
+            while name in registry:
+                name = f"{base}-{i}"
+                i += 1
+            registry[name] = {
+                "path": path,
+                "method": method.upper(),
+                "description": (op.get("description") or "").strip(),
+                "path_params": [p for p in params if p.get("in") == "path"],
+                "query_params": [p for p in params if p.get("in") == "query"],
+                "body": _extract_body_schema(op),
+            }
+    return registry
+
+
+# ---------------------------------------------------------------------------
+# rate limiting
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """Thread-safe spacing of requests to at most `rps` per second."""
+
+    def __init__(self, rps: float):
+        self.interval = (1.0 / rps) if rps and rps > 0 else 0.0
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def acquire(self) -> None:
+        if not self.interval:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait = max(0.0, self._next_at - now)
+            self._next_at = max(now, self._next_at) + self.interval
+        if wait:
+            time.sleep(wait)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface 3xx as an HTTPError so we can replay POST bodies ourselves.
+
+    urllib refuses to follow a 307 for a POST and would drop the body if it did,
+    and POST /people/search 307-redirects on every call.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+# ---------------------------------------------------------------------------
+# http
+# ---------------------------------------------------------------------------
+
+def _classify(status: int, body_text: str, url: str) -> ApiError:
+    message = body_text.strip()
+    try:
+        parsed = json.loads(body_text)
+        if isinstance(parsed, dict):
+            message = str(parsed.get("error") or parsed.get("message") or message)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if status == 401 or status == 403:
+        return AuthError(status, message or "invalid or expired API key", url)
+    lowered = message.lower()
+    miss = status in (404, 500) and any(m in lowered for m in MISS_MARKERS)
+    return ApiError(status, message or f"HTTP {status}", url, miss=miss)
+
+
+def _same_host(a: str, b: str) -> bool:
+    return urllib.parse.urlsplit(a).netloc == urllib.parse.urlsplit(b).netloc
+
+
+def http_request(
+    method: str,
+    path: str,
+    query: dict | None = None,
+    body: object = None,
+    api_key: str = "",
+    verbose: bool = False,
+    dry_run: bool = False,
+    limiter: RateLimiter | None = None,
+    retries: int = 4,
+    timeout: int = 60,
+) -> object:
+    """Single HTTP entry point. Raises ApiError on failure — never exits."""
+    qs_pairs = [(k, v) for k, v in (query or {}).items() if v is not None and v != ""]
+    qs = urllib.parse.urlencode(qs_pairs, doseq=True)
+    url = BASE_URL + path + (("?" + qs) if qs else "")
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+        "Authorization": f"Bearer {api_key}",
+    }
+    data = None
+    if method in ("POST", "PUT", "PATCH") and body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+
+    if verbose:
+        sys.stderr.write(f"-> {method} {url}\n")
+        if data is not None:
+            sys.stderr.write(f"   body: {data.decode()}\n")
+
+    if dry_run:
+        return {
+            "_dry_run": True,
+            "method": method,
+            "url": url,
+            "headers": {k: v for k, v in headers.items() if k != "Authorization"},
+            "body": body,
+        }
+
+    attempt = 0
+    while True:
+        attempt += 1
+        if limiter:
+            limiter.acquire()
+        try:
+            return _send(method, url, data, headers, timeout, verbose)
+        except AuthError:
+            raise
+        except ApiError as e:
+            retryable = (not e.miss) and (e.status == 429 or e.status is None or (e.status or 0) >= 500)
+            if not retryable or attempt > retries:
+                raise
+            delay = min(30.0, 0.5 * (2 ** (attempt - 1)))
+            if e.status == 429 and e.retry_after:  # type: ignore[attr-defined]
+                delay = max(delay, float(e.retry_after))  # type: ignore[attr-defined]
+            if verbose:
+                sys.stderr.write(f"   retry {attempt}/{retries} in {delay:.1f}s ({e})\n")
+            time.sleep(delay)
+
+
+def _send(method: str, url: str, data, headers: dict, timeout: int, verbose: bool):
+    origin = url
+    for _ in range(MAX_REDIRECTS):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with _OPENER.open(req, timeout=timeout) as resp:
+                text = resp.read().decode(errors="replace") or "null"
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    return text
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                location = e.headers.get("Location")
+                if not location:
+                    raise _classify(e.code, e.read().decode(errors="replace"), url)
+                target = urllib.parse.urljoin(url, location)
+                # Never forward the bearer token to another host.
+                if not _same_host(origin, target):
+                    raise ApiError(e.code, f"refusing cross-host redirect to {target}", url)
+                if e.code == 303:
+                    method, data = "GET", None
+                    headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+                if verbose:
+                    sys.stderr.write(f"   {e.code} -> {target}\n")
+                url = target
+                continue
+            err = _classify(e.code, e.read().decode(errors="replace"), url)
+            if e.code == 429:
+                err.retry_after = e.headers.get("Retry-After")  # type: ignore[attr-defined]
+            raise err
+        except (socket.timeout, TimeoutError) as e:
+            raise ApiError(None, f"timeout (>{timeout}s): {e}", url)
+        except urllib.error.URLError as e:
+            raise ApiError(None, f"network error: {e}", url)
+    raise ApiError(None, f"too many redirects (>{MAX_REDIRECTS})", origin)
+
+
+def resolve_api_key(required: bool = True) -> str:
+    key = os.environ.get(API_KEY_ENV, "").strip()
+    if not key and required:
+        sys.exit(
+            f"set {API_KEY_ENV} in your environment\n"
+            "  create a key at app.firmable.com -> Profile -> Integrations -> API"
+        )
+    return key
+
+
+# ---------------------------------------------------------------------------
+# flattening — one record -> one flat CSV row
+# ---------------------------------------------------------------------------
+
+SEP = "; "
+
+
+def _j(v, sep: str = SEP) -> str:
+    """Render any JSON value as a single CSV-safe cell."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, list):
+        out = []
+        for x in v:
+            if x is None:
+                continue
+            out.append(json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else str(x))
+        return sep.join(out)
+    if isinstance(v, dict):
+        return json.dumps(v, ensure_ascii=False)
+    return str(v)
+
+
+def _emails(block, kind: str) -> list[str]:
+    """People.emails[kind] is a list of {value, deliverability} — or plain strings."""
+    if not isinstance(block, dict):
+        return []
+    vals = block.get(kind) or []
+    if isinstance(vals, str):
+        return [vals]
+    out = []
+    for e in vals:
+        if isinstance(e, dict):
+            if e.get("value"):
+                out.append(str(e["value"]))
+        elif e:
+            out.append(str(e))
+    return out
+
+
+COMPANY_COLUMNS = [
+    "id", "name", "fqdn", "website", "abn", "acn", "nzbn", "uen",
+    "anzsic", "naics", "sic", "duns", "abn_operation_status",
+    "employee_count", "company_size", "company_type", "revenue", "year_founded",
+    "hq_location", "hq_country", "states", "locations", "industries",
+    "phones", "emails", "linkedin", "twitter", "facebook", "instagram", "youtube",
+    "org_registers", "technographics", "keywords", "tagline", "description",
+]
+
+
+def flatten_company(rec: dict) -> dict:
+    if not isinstance(rec, dict):
+        return {}
+    codes = rec.get("industry_codes") or {}
+    social = rec.get("social_media") or {}
+    nextgen = rec.get("nextGen") or {}
+    tech = nextgen.get("technographics") or {}
+    tech_flat = []
+    if isinstance(tech, dict):
+        for category, items in tech.items():
+            tech_flat.append(f"{category}: {', '.join(items)}" if isinstance(items, list) else f"{category}: {items}")
+    row = {c: "" for c in COMPANY_COLUMNS}
+    row.update({
+        "id": _j(rec.get("id")),
+        "name": _j(rec.get("name")),
+        "fqdn": _j(rec.get("fqdn")),
+        "website": _j(rec.get("website")),
+        "abn": _j(codes.get("abn")),
+        "acn": _j(codes.get("acn")),
+        "nzbn": _j(codes.get("nzbn")),
+        "uen": _j(codes.get("uen")),
+        "anzsic": _j(codes.get("anzsic")),
+        "naics": _j(codes.get("naics")),
+        "sic": _j(codes.get("sic")),
+        "duns": _j(codes.get("duns")),
+        "abn_operation_status": _j(rec.get("abn_operation_status")),
+        "employee_count": _j(rec.get("employee_count")),
+        "company_size": _j(rec.get("company_size")),
+        "company_type": _j(rec.get("company_type")),
+        "revenue": _j(rec.get("revenue")),
+        "year_founded": _j(rec.get("year_founded")),
+        "hq_location": _j(rec.get("hq_location")),
+        "hq_country": _j(rec.get("hq_country")),
+        "states": _j(rec.get("states")),
+        "locations": _j(rec.get("locations")),
+        "industries": _j(rec.get("industries")),
+        "phones": _j(rec.get("phones")),
+        "emails": _j(rec.get("emails")),
+        "linkedin": _j(rec.get("linkedin")),
+        "twitter": _j((social.get("twitter") or {}).get("handle") if isinstance(social.get("twitter"), dict) else social.get("twitter")),
+        "facebook": _j((social.get("facebook") or {}).get("handle") if isinstance(social.get("facebook"), dict) else social.get("facebook")),
+        "instagram": _j((social.get("instagram") or {}).get("handle") if isinstance(social.get("instagram"), dict) else social.get("instagram")),
+        "youtube": _j((social.get("youtube") or {}).get("handle") if isinstance(social.get("youtube"), dict) else social.get("youtube")),
+        "org_registers": _j(list((rec.get("org_registers") or {}).values())),
+        "technographics": _j(tech_flat),
+        "keywords": _j(rec.get("keywords")),
+        "tagline": _j(rec.get("tagline")),
+        "description": _j(rec.get("description")),
+    })
+    return row
+
+
+PEOPLE_COLUMNS = [
+    "id", "name", "first_name", "last_name", "position", "seniority", "department",
+    "headline", "linkedin", "linkedin_url", "location", "country",
+    "work_email", "personal_email",
+    "mobile", "mobile_dnd", "phones_all",
+    "company_id", "company_name", "company_website", "company_size", "company_industry",
+    "company_linkedin", "time_in_current_role", "year_joined", "month_joined",
+    "skills", "education", "secondary_positions",
+]
+
+
+def flatten_person(rec: dict) -> dict:
+    if not isinstance(rec, dict):
+        return {}
+    company = rec.get("current_company") or {}
+    phones = rec.get("phones") or []
+    clean, dnd = [], []
+    for p in phones:
+        if isinstance(p, dict):
+            val = p.get("value")
+            if not val:
+                continue
+            (dnd if p.get("is_dnd") else clean).append(str(val))
+        elif p:
+            clean.append(str(p))
+    slug = rec.get("linkedin") or ""
+    edu = rec.get("education") or {}
+    if isinstance(edu, dict):
+        edu_txt = " / ".join(x for x in [edu.get("school_name"), edu.get("degree"), edu.get("field")] if x)
+    else:
+        edu_txt = _j(edu)
+    secondary = []
+    for s in (rec.get("secondary_position") or []):
+        if isinstance(s, dict):
+            secondary.append(f"{s.get('cleaned_position') or ''} @ {s.get('company_name') or ''}".strip(" @"))
+    row = {c: "" for c in PEOPLE_COLUMNS}
+    row.update({
+        "id": _j(rec.get("id")),
+        "name": _j(rec.get("name")),
+        "first_name": _j(rec.get("first_name")),
+        "last_name": _j(rec.get("last_name")),
+        "position": _j(rec.get("position")),
+        "seniority": _j(rec.get("seniority")),
+        "department": _j(rec.get("department")),
+        "headline": _j(rec.get("headline")),
+        "linkedin": _j(slug),
+        "linkedin_url": f"https://www.linkedin.com/in/{slug}/" if slug else "",
+        "location": _j(rec.get("location")),
+        "country": _j(rec.get("country")),
+        "work_email": _j(_emails(rec.get("emails"), "work")),
+        "personal_email": _j(_emails(rec.get("emails"), "personal")),
+        "mobile": _j(clean),
+        "mobile_dnd": _j(dnd),
+        "phones_all": _j([p.get("value") if isinstance(p, dict) else p for p in phones]),
+        "company_id": _j(company.get("id")),
+        "company_name": _j(company.get("name")),
+        "company_website": _j(company.get("website")),
+        "company_size": _j(company.get("size")),
+        "company_industry": _j(company.get("industry")),
+        "company_linkedin": _j(company.get("linkedin")),
+        "time_in_current_role": _j(rec.get("time_in_current_role")),
+        "year_joined": _j(rec.get("year_joined")),
+        "month_joined": _j(rec.get("month_joined")),
+        "skills": _j(rec.get("skills")),
+        "education": _j(edu_txt),
+        "secondary_positions": _j(secondary),
+    })
+    return row
+
+
+SEARCH_COLUMNS = [
+    "person_id", "name", "position", "company_name", "linkedin", "linkedin_url",
+    "has_email", "has_personal_email", "has_phone", "has_mobile", "has_dnd_phone",
+]
+
+
+def flatten_search_hit(rec: dict) -> dict:
+    if not isinstance(rec, dict):
+        return {}
+    slug = rec.get("linkedin") or ""
+    row = {c: "" for c in SEARCH_COLUMNS}
+    row.update({
+        "person_id": _j(rec.get("person_id") or rec.get("id")),
+        "name": _j(rec.get("name") or rec.get("pName")),
+        "position": _j(rec.get("position")),
+        "company_name": _j(rec.get("company_name")),
+        "linkedin": _j(slug),
+        "linkedin_url": f"https://www.linkedin.com/in/{slug}/" if slug else "",
+        "has_email": _j(rec.get("has_email")),
+        "has_personal_email": _j(rec.get("has_personal_email")),
+        "has_phone": _j(rec.get("has_phone")),
+        "has_mobile": _j(rec.get("has_mobile")),
+        "has_dnd_phone": _j(rec.get("has_dnd_phone")),
+    })
+    return row
+
+
+FLATTENERS = {
+    "company": (flatten_company, COMPANY_COLUMNS),
+    "person": (flatten_person, PEOPLE_COLUMNS),
+    "search": (flatten_search_hit, SEARCH_COLUMNS),
+}
+
+
+def write_csv(path: str, rows: list[dict], columns: list[str], lead: list[str] | None = None) -> None:
+    lead = lead or []
+    header = lead + [c for c in columns if c not in lead]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    sys.stderr.write(f"wrote {len(rows):,} rows to {path}\n")
+
+
+# ---------------------------------------------------------------------------
+# response envelopes
+# ---------------------------------------------------------------------------
+
+RECORD_KEYS = ("records", "results", "people", "data")
+
+
+def unwrap_records(payload) -> tuple[list | None, int | None]:
+    """Return (records, total). /people/search wraps them; the spec says it doesn't."""
+    if isinstance(payload, list):
+        return payload, len(payload)
+    if isinstance(payload, dict):
+        for k in RECORD_KEYS:
+            v = payload.get(k)
+            if isinstance(v, list):
+                total = payload.get("total")
+                return v, int(total) if isinstance(total, (int, float)) else None
+    return None, None
+
+
+# At least one of these must be supplied, or the API has nothing to look up.
+IDENTIFIERS = {
+    "company": ["id", "ln_slug", "ln_url", "fqdn", "abn", "website"],
+    "people": ["id", "ln_slug", "ln_url", "work_email", "personal_email"],
+}
+
+CSV_KIND = {"company": "company", "people": "person", "people-search": "search"}
+
+
+def people_search(
+    api_key: str,
+    body: dict,
+    fetch_all: bool = False,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    limiter: RateLimiter | None = None,
+    verbose: bool = False,
+    max_records: int | None = None,
+) -> tuple[list, int | None]:
+    """POST /people/search, optionally paging on `total` until exhausted."""
+    payload = dict(body)
+    if not fetch_all:
+        result = http_request("POST", "/people/search", body=payload, api_key=api_key,
+                              verbose=verbose, limiter=limiter)
+        records, total = unwrap_records(result)
+        return (records if records is not None else []), total
+
+    collected: list = []
+    offset, total = 0, None
+    while True:
+        payload["from"] = str(offset)
+        payload["size"] = str(page_size)
+        result = http_request("POST", "/people/search", body=payload, api_key=api_key,
+                              verbose=verbose, limiter=limiter)
+        records, page_total = unwrap_records(result)
+        if page_total is not None:
+            total = page_total
+        if not records:
+            break
+        collected.extend(records)
+        if max_records and len(collected) >= max_records:
+            collected = collected[:max_records]
+            break
+        if total is not None and len(collected) >= total:
+            break
+        if len(records) < page_size:
+            break
+        offset += page_size
+    return collected, total
+
+
+# ---------------------------------------------------------------------------
+# spec-driven single-record commands
+# ---------------------------------------------------------------------------
+
+def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
+    meta = registry[name]
+    method = meta["method"]
+    body_props = (meta.get("body") or {}).get("properties") or {}
+    body_required = set((meta.get("body") or {}).get("required_top") or [])
+
+    parser = argparse.ArgumentParser(prog=f"firmable {name}", description=meta["description"])
+    dest_map: dict[str, str] = {}
+    for p in meta["path_params"]:
+        parser.add_argument(p["name"], help=(p.get("description") or "").strip())
+    for p in meta["query_params"]:
+        dest = _dest_for(p["name"])
+        dest_map[dest] = p["name"]
+        parser.add_argument(*_flag_names(p["name"]), dest=dest,
+                            choices=(p.get("schema") or {}).get("enum"),
+                            help=(p.get("description") or "").strip())
+    for fname, fschema in body_props.items():
+        dest = _dest_for(fname)
+        dest_map[dest] = fname
+        flags = _flag_names(fname)
+        if fname == "selectedCountry":
+            flags.append("--country")
+        parser.add_argument(*flags, dest=dest, choices=fschema.get("enum"),
+                            help=(fschema.get("description") or "").strip())
+    if name == "people-search":
+        parser.add_argument("--all", action="store_true",
+                            help="Page through every match (uses `total` from the response)")
+        parser.add_argument("--max", type=int, default=None,
+                            help="Stop after this many records when using --all")
+        parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
+                            help=f"Records per page when using --all (default {DEFAULT_PAGE_SIZE})")
+    if method != "GET":
+        parser.add_argument("--body",
+                            help="JSON string for the request body (--<field> flags merge over it)")
+    parser.add_argument("--out", help="Write JSON to this file instead of stdout")
+    parser.add_argument("--csv", help="Also write a flattened CSV to this path")
+    parser.add_argument("--raw", action="store_true", help="Print the response envelope untouched")
+    parser.add_argument("--verbose", action="store_true", help="Log the request to stderr")
+    parser.add_argument("--dry-run", action="store_true", help="Show the request without sending it")
+    args = parser.parse_args(argv)
+
+    api_key = resolve_api_key(required=not args.dry_run)
+    supplied = {dest_map[d]: v for d, v in vars(args).items() if d in dest_map and v not in (None, "")}
+
+    if method == "GET":
+        wanted = IDENTIFIERS.get(name)
+        if wanted and not any(k in supplied for k in wanted):
+            sys.exit(f"firmable {name}: supply at least one of " + ", ".join(f"--{w}" for w in wanted))
+        try:
+            result = http_request("GET", meta["path"], query=supplied, api_key=api_key,
+                                  verbose=args.verbose, dry_run=args.dry_run)
+        except ApiError as e:
+            sys.exit(f"firmable {name}: {e}")
+        records = None
+    else:
+        body: dict = json.loads(args.body) if getattr(args, "body", None) else {}
+        body.update(supplied)
+        missing = [f for f in body_required if f not in body]
+        if missing and not args.dry_run:
+            sys.exit(f"firmable {name}: missing required " + ", ".join(f"--{m}" for m in missing))
+        try:
+            if name == "people-search" and not args.dry_run:
+                records, total = people_search(
+                    api_key, body, fetch_all=args.all, page_size=args.page_size,
+                    verbose=args.verbose, max_records=args.max,
+                )
+                result = {"total": total, "count": len(records), "records": records}
+            else:
+                result = http_request(method, meta["path"], body=body, api_key=api_key,
+                                      verbose=args.verbose, dry_run=args.dry_run)
+                records, _ = unwrap_records(result)
+        except ApiError as e:
+            sys.exit(f"firmable {name}: {e}")
+
+    if args.csv and not args.dry_run:
+        flatten, columns = FLATTENERS[CSV_KIND.get(name, "company")]
+        source = records if records is not None else [result]
+        write_csv(args.csv, [flatten(r) for r in source if isinstance(r, dict)], columns)
+
+    payload = result
+    if records is not None and not args.raw and name == "people-search":
+        payload = result
+    out_text = json.dumps(payload, indent=2, ensure_ascii=False)
+    if args.out:
+        Path(args.out).write_text(out_text)
+        sys.stderr.write(f"wrote {len(out_text):,} bytes to {args.out}\n")
+    elif not args.csv:
+        print(out_text)
+
+
+# ---------------------------------------------------------------------------
+# batch — CSV in, JSONL + CSV out, rate limited, resumable
+# ---------------------------------------------------------------------------
+
+def read_input_rows(path: str, column: str | None, default_column: str) -> tuple[list[dict], list[str], str]:
+    """Read a CSV and decide which column holds the lookup value.
+
+    Falls back to the only column when the file has just one, which is what a
+    pasted list of domains or LinkedIn URLs usually looks like.
+    """
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fields = list(reader.fieldnames or [])
+        rows = [r for r in reader]
+    if not fields:
+        sys.exit(f"{path}: no header row found")
+    chosen = column or (default_column if default_column in fields else None)
+    if chosen is None and len(fields) == 1:
+        chosen = fields[0]
+    if chosen is None:
+        sys.exit(
+            f"{path}: no column named '{default_column}'. Pass --column with one of: "
+            + ", ".join(fields)
+        )
+    if chosen not in fields:
+        sys.exit(f"{path}: no column named '{chosen}'. Available: " + ", ".join(fields))
+    return rows, fields, chosen
+
+
+def _load_done(out_path: Path) -> set:
+    done = set()
+    if not out_path.exists():
+        return done
+    with out_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("_input") is not None:
+                done.add(rec["_input"])
+    return done
+
+
+def run_batch(values: list[str], worker, out_path: Path, rps: float, concurrency: int,
+              resume: bool, label: str) -> None:
+    """Fan `values` out over `worker(value, limiter)`, appending JSONL as they land."""
+    done = _load_done(out_path) if resume else set()
+    todo = [v for v in dict.fromkeys(values) if v and v not in done]
+    if done:
+        sys.stderr.write(f"{label}: {len(done):,} already in {out_path.name}, {len(todo):,} to go\n")
+    if not todo:
+        sys.stderr.write(f"{label}: nothing to do\n")
+        return
+
+    limiter = RateLimiter(rps)
+    lock = threading.Lock()
+    counts = {"ok": 0, "miss": 0, "err": 0}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+
+    with out_path.open("a", encoding="utf-8") as fh, ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = {ex.submit(worker, v, limiter): v for v in todo}
+        for n, fut in enumerate(as_completed(futures), 1):
+            value = futures[fut]
+            try:
+                rec = {"_input": value, "_ok": True, "data": fut.result()}
+                counts["ok"] += 1
+            except AuthError as e:
+                sys.stderr.write(f"\n{label}: {e} — stopping (fix {API_KEY_ENV} and re-run to resume)\n")
+                for f2 in futures:
+                    f2.cancel()
+                break
+            except ApiError as e:
+                rec = {"_input": value, "_ok": False, "_miss": e.miss,
+                       "_status": e.status, "_error": e.message}
+                counts["miss" if e.miss else "err"] += 1
+            except Exception as e:  # noqa: BLE001 — one bad row must not kill the run
+                rec = {"_input": value, "_ok": False, "_miss": False,
+                       "_status": None, "_error": repr(e)}
+                counts["err"] += 1
+            with lock:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fh.flush()
+            if n % 25 == 0 or n == len(todo):
+                rate = n / max(0.001, time.monotonic() - started)
+                sys.stderr.write(
+                    f"\r{label}: {n:,}/{len(todo):,}  hit={counts['ok']:,} "
+                    f"miss={counts['miss']:,} err={counts['err']:,}  {rate:.1f}/s"
+                )
+                sys.stderr.flush()
+    sys.stderr.write("\n")
+
+
+def jsonl_to_csv(jsonl_path: Path, csv_path: str, kind: str, order: list[str],
+                 extra: dict[str, dict] | None = None) -> None:
+    """Rebuild a CSV from the JSONL, in the order the inputs were supplied."""
+    flatten, columns = FLATTENERS[kind]
+    by_input: dict[str, dict] = {}
+    with jsonl_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            by_input[rec.get("_input")] = rec
+
+    rows = []
+    for value in order:
+        rec = by_input.get(value)
+        base = {"_input": value, "_status": "", "_error": ""}
+        if rec is None:
+            base["_status"] = "not run"
+        elif rec.get("_ok"):
+            base["_status"] = "hit"
+            base.update(flatten(rec.get("data") or {}))
+        else:
+            base["_status"] = "miss" if rec.get("_miss") else "error"
+            base["_error"] = rec.get("_error") or ""
+        if extra and value in extra:
+            base.update(extra[value])
+        rows.append(base)
+
+    lead = ["_input", "_status", "_error"]
+    if extra:
+        lead += [k for k in next(iter(extra.values())).keys() if k not in lead]
+    write_csv(csv_path, rows, columns, lead=lead)
+
+
+def _batch_parser(prog: str, default_column: str, choices: list[str]) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog=prog)
+    p.add_argument("input", help="Input CSV")
+    p.add_argument("--by", default=default_column, choices=choices,
+                   help=f"Firmable lookup field (default {default_column})")
+    p.add_argument("--column", help="CSV column holding the lookup value (default: same as --by)")
+    p.add_argument("--out", help="JSONL output path (default: alongside --csv, or <input>.firmable.jsonl)")
+    p.add_argument("--csv", help="Flattened CSV output path")
+    p.add_argument("--keep-columns", help="Comma-separated input columns to echo into the CSV")
+    p.add_argument("--rps", type=float, default=DEFAULT_RPS,
+                   help=f"Requests per second (default {DEFAULT_RPS}, API ceiling {RATE_LIMIT_CEILING})")
+    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                   help=f"Worker threads (default {DEFAULT_CONCURRENCY})")
+    p.add_argument("--limit", type=int, help="Only process the first N rows")
+    p.add_argument("--force", action="store_true",
+                   help="Re-fetch rows already present in the JSONL (spends credits again)")
+    p.add_argument("--verbose", action="store_true", help="Log every request to stderr")
+    return p
+
+
+def _resolve_out(args, input_path: str) -> Path:
+    if args.out:
+        return Path(args.out)
+    if args.csv:
+        return Path(args.csv).with_suffix(Path(args.csv).suffix + ".jsonl")
+    return Path(input_path).with_suffix(".firmable.jsonl")
+
+
+def _extras(rows, chosen, keep_columns):
+    if not keep_columns:
+        return None
+    keep = [c.strip() for c in keep_columns.split(",") if c.strip()]
+    extra = {}
+    for r in rows:
+        value = (r.get(chosen) or "").strip()
+        if value:
+            extra[value] = {f"in_{c}": r.get(c, "") for c in keep}
+    return extra or None
+
+
+def cmd_lookup_batch(argv: list[str], endpoint: str) -> None:
+    """company-batch / people-batch — one GET per input row."""
+    choices = IDENTIFIERS[endpoint]
+    default_column = "fqdn" if endpoint == "company" else "ln_url"
+    args = _batch_parser(f"firmable {endpoint}-batch", default_column, choices).parse_args(argv)
+    if args.rps > RATE_LIMIT_CEILING:
+        sys.exit(f"--rps {args.rps} exceeds Firmable's documented {RATE_LIMIT_CEILING}/s ceiling")
+
+    api_key = resolve_api_key()
+    rows, _, chosen = read_input_rows(args.input, args.column, args.by)
+    values = [(r.get(chosen) or "").strip() for r in rows]
+    values = [v for v in values if v]
+    if args.limit:
+        values = values[: args.limit]
+    if not values:
+        sys.exit(f"{args.input}: column '{chosen}' is empty")
+
+    path = "/company" if endpoint == "company" else "/people"
+
+    def worker(value: str, limiter: RateLimiter):
+        return http_request("GET", path, query={args.by: value}, api_key=api_key,
+                            verbose=args.verbose, limiter=limiter)
+
+    out_path = _resolve_out(args, args.input)
+    sys.stderr.write(
+        f"{endpoint}-batch: {len(values):,} lookups by --by {args.by} from column '{chosen}' "
+        f"-> {out_path}\n"
+    )
+    run_batch(values, worker, out_path, args.rps, args.concurrency,
+              resume=not args.force, label=f"{endpoint}-batch")
+    if args.csv:
+        kind = "company" if endpoint == "company" else "person"
+        jsonl_to_csv(out_path, args.csv, kind, list(dict.fromkeys(values)),
+                     extra=_extras(rows, chosen, args.keep_columns))
+
+
+def cmd_roster(argv: list[str]) -> None:
+    """roster — people/search fanned out over a CSV of Firmable company ids."""
+    p = argparse.ArgumentParser(
+        prog="firmable roster",
+        description="For each company id, page /people/search. --enrich then buys full "
+                    "contact records for every person found (one extra call each).",
+    )
+    p.add_argument("input", help="Input CSV of Firmable company ids")
+    p.add_argument("--column", default="id", help="CSV column holding the company id (default: id)")
+    p.add_argument("--position", help="Filter by position")
+    p.add_argument("--seniority", help="Filter by seniority")
+    p.add_argument("--department", help="Filter by department")
+    p.add_argument("--country", default=None, help="selectedCountry (default AU at the API)")
+    p.add_argument("--per-company", type=int, default=None, help="Cap people returned per company")
+    p.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
+    p.add_argument("--enrich", action="store_true",
+                   help="Also GET /people for each hit — full emails and mobiles, one call per person")
+    p.add_argument("--only-contactable", action="store_true",
+                   help="With --enrich, only enrich people the search says have an email or mobile")
+    p.add_argument("--out", help="JSONL output path")
+    p.add_argument("--csv", help="Flattened CSV output path")
+    p.add_argument("--rps", type=float, default=DEFAULT_RPS)
+    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    p.add_argument("--limit", type=int, help="Only process the first N companies")
+    p.add_argument("--force", action="store_true", help="Re-fetch companies already in the JSONL")
+    p.add_argument("--verbose", action="store_true")
+    args = p.parse_args(argv)
+    if args.rps > RATE_LIMIT_CEILING:
+        sys.exit(f"--rps {args.rps} exceeds Firmable's documented {RATE_LIMIT_CEILING}/s ceiling")
+
+    api_key = resolve_api_key()
+    rows, _, chosen = read_input_rows(args.input, args.column, "id")
+    values = [v for v in ((r.get(chosen) or "").strip() for r in rows) if v]
+    if args.limit:
+        values = values[: args.limit]
+    if not values:
+        sys.exit(f"{args.input}: column '{chosen}' is empty")
+
+    base_body = {k: v for k, v in (
+        ("position", args.position),
+        ("seniority", args.seniority),
+        ("department", args.department),
+        ("selectedCountry", args.country),
+    ) if v}
+
+    def worker(company_id: str, limiter: RateLimiter):
+        body = dict(base_body, companyId=company_id)
+        records, total = people_search(api_key, body, fetch_all=True, page_size=args.page_size,
+                                       limiter=limiter, verbose=args.verbose,
+                                       max_records=args.per_company)
+        if args.enrich:
+            enriched = []
+            for hit in records:
+                pid = hit.get("person_id") or hit.get("id")
+                if not pid:
+                    continue
+                if args.only_contactable and not (hit.get("has_email") or hit.get("has_mobile")):
+                    enriched.append({**hit, "_enriched": False, "_skipped": "no contact signal"})
+                    continue
+                try:
+                    full = http_request("GET", "/people", query={"id": pid}, api_key=api_key,
+                                        verbose=args.verbose, limiter=limiter)
+                    enriched.append({**(full or {}), "_enriched": True, "_search": hit})
+                except AuthError:
+                    raise
+                except ApiError as e:
+                    enriched.append({**hit, "_enriched": False, "_error": e.message})
+            records = enriched
+        return {"total": total, "count": len(records), "records": records}
+
+    out_path = _resolve_out(args, args.input)
+    sys.stderr.write(f"roster: {len(values):,} companies from column '{chosen}' -> {out_path}\n")
+    if args.enrich:
+        sys.stderr.write("roster: --enrich buys one extra lookup per person found\n")
+    run_batch(values, worker, out_path, args.rps, args.concurrency,
+              resume=not args.force, label="roster")
+
+    if args.csv:
+        kind = "person" if args.enrich else "search"
+        flatten, columns = FLATTENERS[kind]
+        out_rows = []
+        with out_path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                company_id = rec.get("_input")
+                if not rec.get("_ok"):
+                    out_rows.append({"_company_id": company_id,
+                                     "_status": "miss" if rec.get("_miss") else "error",
+                                     "_error": rec.get("_error") or ""})
+                    continue
+                for person in (rec.get("data") or {}).get("records") or []:
+                    row = {"_company_id": company_id, "_status": "hit", "_error": person.get("_error", "")}
+                    row.update(flatten(person))
+                    out_rows.append(row)
+        write_csv(args.csv, out_rows, columns, lead=["_company_id", "_status", "_error"])
+
+
+# ---------------------------------------------------------------------------
+# help / dispatch
+# ---------------------------------------------------------------------------
+
+BATCH_COMMANDS = {
+    "company-batch": "bulk /company lookups from a CSV column",
+    "people-batch": "bulk /people lookups from a CSV column",
+    "roster": "people/search per company id, optionally enriched to full contact records",
+}
+
+
+def cmd_commands(registry: dict) -> None:
+    print("Endpoint commands (from openapi.json):")
+    width = max([len(n) for n in registry] + [len(n) for n in BATCH_COMMANDS])
+    for name in sorted(registry):
+        meta = registry[name]
+        print(f"  {name:<{width}}  {meta['method']:5s} {meta['path']}   {meta['description']}")
+    print("\nBatch commands (CSV in, JSONL + CSV out, rate limited, resumable):")
+    for name, desc in BATCH_COMMANDS.items():
+        print(f"  {name:<{width}}  {desc}")
+    print("\nAlso: mcp (Firmable MCP tools over the CLI), commands, help <name>")
+    print("`firmable help <name>` for flags. Every lookup spends credits.")
+
+
+def cmd_help(registry: dict, command: str | None) -> None:
+    if not command:
+        sys.exit("usage: firmable help <command>")
+    if command in BATCH_COMMANDS:
+        if command == "roster":
+            cmd_roster(["--help"])
+        else:
+            cmd_lookup_batch(["--help"], command.replace("-batch", ""))
+        return
+    if command not in registry:
+        sys.exit(f"unknown command: {command}\n\nRun: firmable commands")
+    run_endpoint(registry, command, ["--help"])
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-V", "--version"):
+        print(f"firmable-cli {VERSION}")
+        return
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+
+    cmd, rest = argv[0], argv[1:]
+    registry = build_registry(load_spec())
+
+    if cmd == "commands":
+        cmd_commands(registry)
+        return
+    if cmd == "help":
+        cmd_help(registry, rest[0] if rest else None)
+        return
+    if cmd in ("company-batch", "people-batch"):
+        cmd_lookup_batch(rest, cmd.replace("-batch", ""))
+        return
+    if cmd == "roster":
+        cmd_roster(rest)
+        return
+    if cmd == "mcp":
+        # Resolve alongside the real script so a symlinked/shimmed firmable works.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from firmable_mcp import main as mcp_main  # noqa: PLC0415 — optional module
+        mcp_main(rest)
+        return
+    if cmd in registry:
+        run_endpoint(registry, cmd, rest)
+        return
+
+    known = list(registry) + list(BATCH_COMMANDS) + ["mcp", "commands", "help"]
+    suggestions = difflib.get_close_matches(cmd, known, n=3, cutoff=0.5)
+    msg = f"unknown command: {cmd}"
+    if suggestions:
+        msg += "\n\nDid you mean:\n" + "\n".join(f"  {s}" for s in suggestions)
+    sys.exit(msg + "\n\nRun: firmable commands")
+
+
+if __name__ == "__main__":
+    main()
