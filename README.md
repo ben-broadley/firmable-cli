@@ -30,12 +30,13 @@ access, it is the better one for most work.
 
 | If you want to | Use | Costs |
 | --- | --- | --- |
-| **find** companies or people by criteria | `firmable mcp call filter_search` | free |
-| enrich a list you already have | `company-batch` / `people-batch` | 1 credit per row |
-| get work emails at volume | `firmable mcp call bulk_reveal_person_emails` | **free** |
-| get mobile numbers | either | 1 credit each |
-| script something in a cron job with an API key | the REST commands | per lookup |
-| push straight into HubSpot or Salesforce | `firmable mcp call push_to_crm` | 1 credit each |
+| **find** companies or people by criteria | `firmable mcp call filter_search` | **free** |
+| see who works somewhere, and who has a mobile | `people-search` or `roster` | **free** |
+| **work emails at volume** | `firmable mcp call bulk_reveal_person_emails` | **free** |
+| mobile numbers | `bulk_get_people` (profile + email + phone) | 1 per person |
+| enrich a list of domains you already have | `company-batch` | 1 per row |
+| script something unattended with an API key | the REST commands | per lookup |
+| push into HubSpot or Salesforce | `firmable mcp call push_to_crm` | 1 per profile |
 
 The REST API cannot search. Every endpoint needs an identifier you already hold, so it enriches
 but never discovers. It also authenticates with a plain API key, which makes it the right choice
@@ -238,30 +239,40 @@ callback port from Firmable's own documentation instead.
 
 ## Credits
 
+Measured against a live account on 2026-08-21, one call at a time against the balance.
+Firmable does not publish an API credit model, and two of their own tool descriptions
+disagree with each other, so these are observed numbers rather than quoted ones.
+
 | Action | Cost |
 | --- | --- |
-| `company` / `people` lookup that hits | 1 credit |
-| `people-search` | **1 credit per call** |
-| lookup that misses | 0 |
-| re-fetching a record you already bought | 0 |
+| **Any search** — REST `people-search`, MCP `filter_search` / `ai_search` | **free** |
+| MCP `reveal_person_email` / `bulk_reveal_person_emails` | **free** |
+| MCP list, signal and filter-option tools | free |
+| REST `company` / `people` that hits | 1 |
+| MCP `get_company` / `get_person`, `bulk_get_*` | 1 each |
+| MCP `reveal_person_phone` / `bulk_reveal_person_phones` | 1 each |
+| A lookup that misses | 0 |
+| Re-fetching a record you already bought | 0 |
 | `--dry-run`, `help`, `commands` | 0 |
 
-**`people-search` bills per call, not per record.** This is the one that catches people out.
-A single call returning 200 people costs the same as one returning 2, so paging is what costs
-you: `--all` over 2,000 people at the default page size is 20 calls and 20 credits. Pull the
-biggest page you can rather than walking small ones.
+**Only record retrieval costs anything. Searching never does.** Search freely to size and
+qualify before you spend: page every person at a company, see who has a mobile and who is
+DNC-flagged, then buy only the ones worth having.
 
-```bash
-firmable people-search --company-id X --all --page-size 200   # cheaper
-firmable people-search --company-id X --all --page-size 10    # 20x the calls
-```
+**Work emails are free, and only through MCP.** `bulk_reveal_person_emails` returns unmasked
+work addresses for 100 people per call at no cost, where REST `/people` charges a credit for a
+record carrying the same address. If you want emails at volume, never use the REST side.
 
-`roster` inherits this. Listing everyone at a 1,600-person company is around 16 credits before
-you enrich anybody, and `--enrich` then buys one lookup per person on top. Bound both ends with
-`--per-company` and `--only-contactable`.
+**If you need a phone, buy the whole profile.** `get_person` and `reveal_person_phone` both cost
+1 credit, but `get_person` returns the profile, the email *and* the phone, where
+`reveal_person_phone` returns only the number. There is no reason to prefer the narrower one.
 
-Batch commands resume from their JSONL by default, so an interrupted run never re-buys a row.
-That is the main defence against paying twice, and `--force` is the only way to override it.
+That gives one sensible default: **search free → reveal emails free → spend credits only on the
+people you actually want phone numbers for.**
+
+Repeat fetches are deduped per profile, so re-running a job is safe. Batch commands also resume
+from their JSONL by default, which is the main defence against paying twice; `--force` is the
+only way to override it.
 
 ## Licence
 

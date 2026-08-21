@@ -29,12 +29,14 @@ app.firmable.com -> Profile -> Integrations -> API. Keys start with `fbl_`.
 Rate limit: 50 requests/second per API key. Batch commands default to 20 rps
 across 8 worker threads; raise with --rps / --concurrency at your own risk.
 
-Credits: every successful lookup consumes one Firmable credit. A miss costs
-nothing, and re-fetching a record you already bought costs nothing.
+Credits (measured against a live account, not published by Firmable):
+  company / people lookup that hits ... 1 credit
+  people-search ..................... FREE, however many pages
+  a miss ............................ 0
+  re-fetching a record you own ...... 0
 
-people-search bills PER CALL, not per record — a call returning 200 people costs
-the same as one returning 2, so paging is what costs you. Use the largest
---page-size you can rather than walking small pages.
+Only record retrieval costs anything. Searching is free, so use people-search
+freely to size and qualify a company before spending on the people in it.
 
 Batch commands resume from their JSONL output by default, so a re-run never
 re-buys a row you already have — pass --force to override. --dry-run prints the
@@ -680,8 +682,7 @@ def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
                             help=(fschema.get("description") or "").strip())
     if name == "people-search":
         parser.add_argument("--all", action="store_true",
-                            help="Page through every match. COSTS 1 CREDIT PER PAGE — raise "
-                                 "--page-size rather than walking small pages")
+                            help="Page through every match (free — search costs no credits)")
         parser.add_argument("--max", type=int, default=None,
                             help="Stop after this many records when using --all")
         parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
@@ -960,9 +961,9 @@ def cmd_roster(argv: list[str]) -> None:
     """roster — people/search fanned out over a CSV of Firmable company ids."""
     p = argparse.ArgumentParser(
         prog="firmable roster",
-        description="For each company id, page /people/search (1 credit per page). --enrich "
-                    "then buys a full contact record for every person found (1 credit each). "
-                    "Bound both with --per-company and --only-contactable.",
+        description="For each company id, page /people/search (free). --enrich then buys a "
+                    "full contact record for every person found (1 credit each) — bound it "
+                    "with --per-company and --only-contactable.",
     )
     p.add_argument("input", help="Input CSV of Firmable company ids")
     p.add_argument("--column", default="id", help="CSV column holding the company id (default: id)")
