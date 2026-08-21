@@ -23,6 +23,24 @@ Two files and a spec. No dependencies, Python 3.9 or newer.
   Cursor. `firmable mcp` speaks the protocol directly, so the same tools work in a terminal,
   a cron job, or anything that can shell out.
 
+## Which half should I use?
+
+The CLI covers two different Firmable surfaces, and they are not equivalent. If you have MCP
+access, it is the better one for most work.
+
+| If you want to | Use | Costs |
+| --- | --- | --- |
+| **find** companies or people by criteria | `firmable mcp call filter_search` | free |
+| enrich a list you already have | `company-batch` / `people-batch` | 1 credit per row |
+| get work emails at volume | `firmable mcp call bulk_reveal_person_emails` | **free** |
+| get mobile numbers | either | 1 credit each |
+| script something in a cron job with an API key | the REST commands | per lookup |
+| push straight into HubSpot or Salesforce | `firmable mcp call push_to_crm` | 1 credit each |
+
+The REST API cannot search. Every endpoint needs an identifier you already hold, so it enriches
+but never discovers. It also authenticates with a plain API key, which makes it the right choice
+for unattended jobs, where MCP wants a user login.
+
 ## Install
 
 ```bash
@@ -150,6 +168,52 @@ Override any of it with `FIRMABLE_MCP_URL`, `FIRMABLE_MCP_CLIENT_ID`,
 If the server answers `MCP access is disabled for this user`, MCP is not enabled on your
 account yet. That is a switch on Firmable's side and no amount of client configuration will
 move it.
+
+### What the MCP server gives you that REST does not
+
+28 tools, and the difference is not cosmetic. Run `firmable mcp tools` for the live list with
+full schemas; the summary:
+
+| Group | Tools | Cost |
+| --- | --- | --- |
+| **Discovery** | `ai_search`, `filter_search`, `get_filter_options`, `list_saved_searches` | **free** |
+| **Lookalikes** | `find_similar_companies`, `find_similar_people` | free |
+| **Profiles** | `get_company`, `get_person`, `bulk_get_companies`, `bulk_get_people` | 1 credit each, free on repeat |
+| **Emails** | `reveal_person_email`, `bulk_reveal_person_emails` | **free — not credit-gated** |
+| **Phones** | `reveal_person_phone`, `bulk_reveal_person_phones` | 1 credit each |
+| **Lists** | `list_lists`, `get_list`, `create_list`, `rename_list`, add / remove / copy / move | free |
+| **Signals** | `list_signal_agents`, `get_signal_agent`, `agent_signal_hits` | free |
+| **CRM push** | `push_to_crm`, `bulk_push_list_to_crm` | 1 credit each |
+
+Three things stand out.
+
+**Search exists.** The REST API cannot find anything — every endpoint needs an identifier you
+already hold. `filter_search` and `ai_search` do actual discovery, by industry, location, size,
+revenue, seniority, technographics or contact availability, and both are free. Their own
+guidance is to prefer `filter_search`: it is more precise, and `ai_search` runs heavy
+natural-language parsing server-side. Resolve option ids with `get_filter_options` first rather
+than guessing them.
+
+**Emails are free here.** `reveal_person_email` and `bulk_reveal_person_emails` are documented
+as not credit-gated, where the REST `/people` endpoint charges a credit for a record containing
+the same address. If you want work emails at volume, this is the cheaper path by a wide margin.
+Phones still cost a credit either way.
+
+**Bulk means bulk.** `bulk_get_people` and `bulk_reveal_person_emails` take up to 100 profiles
+per call. The REST batch commands in this CLI issue one HTTP request per row because that is all
+the REST API offers.
+
+Costs above are Firmable's own per-tool declarations. Credits are drawn from separate pools —
+`api_enrichment`, `people_phone_viewed`, `crm_push` — so a phone budget and an enrichment budget
+run down independently.
+
+Two behaviours worth knowing before you point an agent at this: credit-charging tools **run
+immediately, with no confirmation step**, and `bulk_reveal_person_phones` is atomic, so a batch
+larger than your remaining balance is rejected outright rather than partially filled.
+
+Start a session with `get_workflow_guide`. It documents the intended chaining
+(`get_*` → `find_similar_*` → `bulk_*` → `reveal_*`) and the filter encoding rules, which are
+fiddly enough that guessing them wastes calls.
 
 ## Where the published spec and the live API disagree
 
