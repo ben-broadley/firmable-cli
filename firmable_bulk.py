@@ -125,6 +125,37 @@ PREFER = [
      "caveat": "the flags tell you whether contact data exists, not what it is"},
 ]
 
+# Firmable's terms of use constrain volume more than their rate limiter does.
+# Published in `firmable costs --json` so an agent planning a large run sees them
+# without having to read prose. Summary, not legal advice.
+TERMS = {
+    "source": "https://firmable.ai/terms-of-use/",
+    "profile_view_ceiling": {
+        "clause": "3.2(a)",
+        "rule": "profile views limited to ~10x the credits allocated to the account, per month",
+        "implication": "free search is free of CREDITS, not unlimited; the view budget is not "
+                       "measurable via the API and 'profile view' is undefined in the terms",
+    },
+    "permitted_use": {
+        "clause": "20.11",
+        "rule": "business to business marketing for your own ordinary business use, "
+                "and not for the benefit of any third party",
+    },
+    "no_bulk_extraction": {
+        "clause": "3.3(e)",
+        "rule": "no exporting, extracting or scraping content off the Service, no resharing or "
+                "rehosting outside it, and no using it to train a large language model",
+        "implication": "enriching into the account holder's own CRM is the intended path",
+    },
+    "abnormal_use": {
+        "clause": "3.2(c)(v), 10.3(c)",
+        "rule": "abnormal or excessive use compared to other users on similar plans is "
+                "unreasonable use, and excessive load is grounds for suspension",
+        "implication": "an endpoint answering quickly is not permission to run at that rate",
+    },
+    "one_seat_one_person": {"clause": "6.1(b), rule: sharing credentials is strictly prohibited"},
+}
+
 NOTES = [
     "Only record retrieval costs credits. Searching never does, on either surface.",
     "Work emails are FREE via MCP, and cost 1 credit via REST /people for the same address.",
@@ -136,6 +167,8 @@ NOTES = [
     "Rate limits are PER TOOL BUCKET: search is unthrottled, bulk enrichment is throttled to ~100 records per 20-60s.",
     "A throttled call returns HTTP 200 with the error in the BODY. Checking only the HTTP status silently drops the whole chunk.",
     "Before any paid call, check PREFER (firmable costs --json), there is usually a free route.",
+    "Credits are not the only ceiling: the terms cap profile views at ~10x your credits per month (3.2a).",
+    "Terms permit use for your OWN business only, not on behalf of a third party (20.11). Check TERMS before volume runs.",
 ]
 
 
@@ -172,6 +205,7 @@ def cmd_costs(argv: list[str]) -> None:
             "operations": {k: v for k, v in items},
             "prefer_free_alternatives": PREFER,
             "rate_limits": RATE_LIMITS,
+            "terms_of_use": TERMS,
             "notes": NOTES,
             "measured_on": "2026-08-21",
             "balance_readable_programmatically": False,
@@ -203,6 +237,11 @@ def cmd_costs(argv: list[str]) -> None:
         print(f"  {name:<11} {rl['observed']}")
         if rl.get("sustained"):
             print(f"              sustained: {rl['sustained']}")
+    print("Terms of use (summary, not legal advice, see firmable.ai/terms-of-use):")
+    print(f"  profile views capped at ~10x your credits per month ({TERMS['profile_view_ceiling']['clause']})")
+    print(f"  own business use only, not for a third party ({TERMS['permitted_use']['clause']})")
+    print(f"  no bulk extraction or LLM training on the data ({TERMS['no_bulk_extraction']['clause']})")
+    print(f"  abnormal load is grounds for suspension ({TERMS['abnormal_use']['clause']})")
     print("\nbasis: measured = spent against a live balance 2026-08-21; "
           "declared = Firmable's own description, unconfirmed.")
 

@@ -302,8 +302,12 @@ Limits are **per tool bucket**, and they are not uniform:
 
 | Bucket | Behaviour |
 | --- | --- |
-| Search (`ai_search`, `filter_search`, REST `people-search`) | no throttling at 64 concurrent / 31 req/s across ~450 calls |
-| Bulk enrichment (`bulk_reveal_person_emails`) | throttled after a couple of calls; retry hints of 21s and 60s, so roughly **100 records per 20–60s** sustained |
+| Search (`ai_search`, `filter_search`, REST `people-search`) | returns no throttling errors, even at high concurrency |
+| Bulk enrichment (`bulk_reveal_person_emails`) | throttled after a couple of calls; retry hints of 21s and 60s, so roughly **100 records per 20 to 60s** sustained |
+
+An endpoint that answers quickly is not permission to hammer it. See
+[Terms of use](#terms-of-use) below; what Firmable's terms allow is tighter than
+what their rate limiter stops.
 
 **A throttled call returns HTTP 200 with the error in the body:**
 
@@ -339,6 +343,31 @@ Two consequences if you are scripting this:
 
 This is also why the costs in this README were measured by watching the balance across single
 calls. There was no other way to establish them.
+
+## Terms of use
+
+Worth reading before you design a large run, because the terms constrain you more
+than the rate limiter does. The clauses that bite:
+
+- **A profile-view ceiling sits on top of credits.** Clause 3.2(a) limits profile
+  views to "approximately 10 times the number of credits allocated to your account
+  on a monthly basis". Free search is free of *credits*, not unlimited. "Profile
+  view" is not defined, and whether search results count is unclear, so treat
+  high-volume search as drawing on a budget you cannot measure.
+- **Permitted Use is your own business.** Clause 20.11: "business to business
+  marketing for your own ordinary business use (and not for the benefit of any
+  third party)".
+- **Bulk extraction is prohibited**, including "resharing, rehosting any of our
+  content outside the Service or for the purposes of training a large language
+  model" (3.3(e)). Enriching records into the account holder's own CRM is the
+  intended path; bulk-dumping the database is not.
+- **Abnormal load is grounds for suspension.** Clause 3.2(c)(v) covers use that is
+  "abnormal or excessive ... compared to the average use by other users on similar
+  plans", and 10.3(c) allows suspension for consuming "excessive bandwidth".
+- **One seat, one person.** Sharing credentials is "strictly prohibited" (6.1(b)).
+
+The defaults in this CLI (5 req/s, 4 workers, paid commands gated behind `--yes`)
+are set with those clauses in mind. This is a summary, not legal advice.
 
 ## Licence
 

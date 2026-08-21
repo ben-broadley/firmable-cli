@@ -142,13 +142,23 @@ when the spend is already bounded by `--limit`.
 
 ## Rate limits
 
-Limits are **per tool bucket**, and they are not uniform:
+Two separate things constrain you: what the server enforces, and what the terms
+of use permit. They are not the same, and the terms are the tighter of the two.
 
-- **Search is not throttled.** 64 concurrent / 31 req/s sustained across ~450
-  calls produced zero errors.
+**What the server enforces** is per tool bucket and not uniform:
+
+- **Search returns no throttling errors**, even at high concurrency. That is an
+  absence of enforcement, not permission. See the terms below.
 - **Bulk enrichment is throttled hard.** `bulk_reveal_person_emails` allows a
   couple of calls then backs you off, returning retry hints of 21s and 60s.
-  Practical sustained throughput is roughly **100 records per 20–60 seconds**.
+  Practical sustained throughput is roughly **100 records per 20 to 60 seconds**.
+
+**What the terms permit** is narrower. Clause 3.2(c)(v) defines unreasonable use
+to include activity "which constitutes abnormal or excessive use of the Service
+compared to the average use by other users on similar plans", and 3.2(c) also
+covers anything "which attempts to bypass or manipulate limitations or usage
+restrictions". An endpoint answering quickly at high concurrency is not an
+invitation to run there. Stay near the defaults.
 
 **The trap:** a throttled call returns **HTTP 200** with the error inside the
 body:
@@ -166,6 +176,39 @@ hint, which is the reason to use them rather than rolling your own loop over
 Defaults are 5 req/s over 4 workers, well below what the server allows.
 Sustained load from a named account invites a limit being imposed. The bulk tools
 take 100 records per call, so a slow request rate still moves plenty.
+
+## The terms of use bind tighter than the rate limiter
+
+Read these before designing a high-volume run. Quoting the clauses because a
+paraphrase loses the teeth.
+
+- **There is a profile-view ceiling on top of credits.** Clause 3.2(a): "credit
+  limits are tied to your Subscription tier and profile views are limited to
+  approximately **10 times the number of credits** allocated to your account on a
+  monthly basis." Free search is free of *credits*, not unlimited. On an 8,000
+  credit plan that is roughly 80,000 profile views a month. "Profile view" is not
+  defined anywhere in the terms, and whether search results count is unclear, so
+  treat volume search as drawing on a budget you cannot measure.
+- **Permitted Use is your own business only.** Clause 20.11 defines it as
+  "business to business marketing for your own ordinary business use (**and not
+  for the benefit of any third party**)". If you are running this on someone
+  else's behalf, check that against the account holder's subscription first.
+- **Bulk extraction is prohibited.** Clause 3.3(e) forbids "export, extract, or
+  otherwise scrape any of the content or data on the Service ... including
+  resharing, rehosting any of our content outside the Service **or for the
+  purposes of training a large language model**". Using the documented API to
+  enrich records into the account holder's own CRM is the intended path.
+  Bulk-dumping the database is not, and feeding it to a model is called out by
+  name.
+- **One seat, one human.** Clause 6.1(b): sharing login credentials "is strictly
+  prohibited". The MCP OAuth token is tied to an individual.
+- **They can suspend you for load.** Clause 10.3(c) covers use that "consumes
+  excessive bandwidth or storage, or is causing harm to our platform", and 3.4
+  reserves the right to block whole territories during "high volumes of bot
+  scraping or data theft".
+
+This is a summary, not legal advice. If a run matters commercially, read the
+terms yourself.
 
 ## Things that will catch you out
 
