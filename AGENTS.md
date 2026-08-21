@@ -65,6 +65,41 @@ different domains. Taking the first hit without checking `fqdn` silently attache
 your contacts to the wrong entity. Only fall back to a paid
 `get_company --arg domain=...` when nothing matches.
 
+**The name you were given is often not the name Firmable indexes.** This is the
+single biggest recall problem on Australian small business, and it is invisible:
+the search succeeds, returns nothing, and reads like the company is absent from
+the dataset.
+
+Registers, licence lists and government datasets carry a *registered or trading*
+name. Firmable indexes what the business actually calls itself, which is usually
+what is in its domain. Measured on 552 Australian aged care providers taken from
+the government's own service list:
+
+| Query | Resolved |
+| --- | --- |
+| The register's trading name | 63 / 552 |
+| Adding a second pass on the domain's brand words | **153 / 552** |
+
+```bash
+firmable mcp call ai_search --arg query="Gorrinn Village" --arg category=company
+# -> nothing
+
+# its domain is araratretirementvillage.com.au
+firmable mcp call ai_search --arg query="Ararat Retirement Village" --arg category=company
+# -> Ararat Retirement Village                          <- resolves first time
+```
+
+Same shape: Deloraine Private Nursing Home is `goldage.com.au` and indexes as
+GoldAge; Christophorus House is `chrv.com.au` and indexes as CHRV; Clendon Care
+Pty Ltd indexes as CLENDON RESIDENCES. **Always run both queries.** Both are
+free, so there is no reason to run only one, and the `fqdn` check still guards
+against a wrong match either way.
+
+Split the domain on its brand words rather than passing it whole:
+`araratretirementvillage.com.au` becomes `ararat retirement village`. Splitting on
+the common sector suffixes (`agedcare`, `homecare`, `healthcare`, `retirement`,
+`village`, `community`, `services`, `group`, `care`, `health`) is enough.
+
 **Everyone at a company, free.**
 
 ```bash
@@ -78,6 +113,22 @@ Paging is free too. Returns name, position, LinkedIn and the `has_*` flags.
 ```bash
 firmable emails people.csv --csv contacts.csv
 ```
+
+**Size the spend before you commit to it, free.** The `has_*` flags turn a
+1-credit-per-person question into a free one. Over 4,472 people at 153 Australian
+aged care providers:
+
+| | Count | |
+| --- | ---: | --- |
+| People found | 4,472 | free |
+| `has_email` | 2,273 | free to reveal too |
+| `has_mobile`, `has_dnd_phone` false | 935 | **the only rows worth buying** |
+| `has_mobile`, on the DNC Register | 380 | free to exclude |
+
+Buying that roster blind is 4,472 credits. Buying the qualified subset is 935, and
+capped at three per account it is 159. **Count first, then decide the cap, then
+spend.** Nearly a third of the mobiles in that pool were DNC-registered, and the
+free flag removed them without an ACMA wash.
 
 **Their mobiles. This is the part that spends.** Filter to the qualified subset first, then:
 
