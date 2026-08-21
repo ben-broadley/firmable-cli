@@ -1,9 +1,8 @@
-"""firmable volume commands — run the MCP tools at scale, with the cost model built in.
+"""firmable volume commands: run the MCP tools at scale, with the cost model built in.
 
 `firmable mcp call <tool>` is the raw escape hatch. These are the commands you
 actually want for volume: they chunk to the bulk endpoints, rate limit
-themselves, resume, write CSV, and — the important part — they know what spends
-credits and what does not.
+themselves, resume, write CSV, and know what spends credits and what does not.
 
     firmable costs                 # the whole cost contract, human readable
     firmable costs --json          # ... machine readable, for agents
@@ -16,7 +15,7 @@ Anything that spends credits refuses to run without --yes, and tells you the
 maximum it could cost first. Free commands just run.
 
 Rate limiting: Firmable's MCP endpoint did not throttle at 64 concurrent /
-31 req/s in testing, but that is not a licence to hammer it — a named account
+31 req/s in testing, but that is not a licence to hammer it, a named account
 generating that load looks like abuse whether or not it is permitted. These
 commands default to 5 req/s over 4 workers. Because the bulk tools take 100
 records per call, that still moves ~500 records/second, so politeness costs
@@ -47,8 +46,8 @@ PER_ITEM = "per_item"
 # THE COST CONTRACT
 #
 # basis:
-#   measured — spent against a live balance, one action at a time, 2026-08-21
-#   declared — Firmable's own tool description, not independently confirmed
+#   measured, spent against a live balance, one action at a time, 2026-08-21
+#   declared. Firmable's own tool description, not independently confirmed
 #
 # Keep this table honest. It is what `firmable costs --json` publishes, and what
 # an agent reads to decide whether an action is safe to take unattended.
@@ -92,7 +91,7 @@ COSTS: dict[str, dict] = {
 
 # Per-tool rate limits, measured 2026-08-21. Buckets are NOT uniform: search is
 # effectively unthrottled, bulk enrichment is throttled hard. A throttled call
-# returns HTTP 200 with the error in the body — see check_payload().
+# returns HTTP 200 with the error in the body, see check_payload().
 RATE_LIMITS = {
     "search": {
         "tools": ["ai_search", "filter_search", "get_filter_options", "people-search"],
@@ -122,7 +121,7 @@ PREFER = [
      "saves": "nothing, but returns the profile and email for the same 1 credit",
      "caveat": "only worth buying for people whose free has_mobile flag is already true"},
     {"instead_of": "buying records to see who exists", "use": "free search + has_email / has_mobile / has_dnd_phone flags",
-     "saves": "everything — sizing an account costs nothing",
+     "saves": "everything, sizing an account costs nothing",
      "caveat": "the flags tell you whether contact data exists, not what it is"},
 ]
 
@@ -130,13 +129,13 @@ NOTES = [
     "Only record retrieval costs credits. Searching never does, on either surface.",
     "Work emails are FREE via MCP, and cost 1 credit via REST /people for the same address.",
     "A lookup that misses costs nothing. Re-fetching a record you already bought costs nothing.",
-    "If you need a phone, prefer mcp:get_person over mcp:reveal_person_phone — same 1 credit, but it returns the profile and email too.",
+    "If you need a phone, prefer mcp:get_person over mcp:reveal_person_phone, same 1 credit, but it returns the profile and email too.",
     "bulk_reveal_person_phones is ATOMIC: a batch larger than your balance is rejected whole, no partial charge.",
     "There is NO way to read your credit balance programmatically. Bound runs up front; you discover exhaustion by failing.",
-    "Credit-charging MCP tools run immediately — the server has no approval gate. This CLI adds one: paid commands need --yes.",
+    "Credit-charging MCP tools run immediately, the server has no approval gate. This CLI adds one: paid commands need --yes.",
     "Rate limits are PER TOOL BUCKET: search is unthrottled, bulk enrichment is throttled to ~100 records per 20-60s.",
     "A throttled call returns HTTP 200 with the error in the BODY. Checking only the HTTP status silently drops the whole chunk.",
-    "Before any paid call, check PREFER (firmable costs --json) — there is usually a free route.",
+    "Before any paid call, check PREFER (firmable costs --json), there is usually a free route.",
 ]
 
 
@@ -180,14 +179,14 @@ def cmd_costs(argv: list[str]) -> None:
         return
 
     width = max(len(k) for k, _ in items)
-    print("FREE — run these as much as you like\n")
+    print("FREE, run these as much as you like\n")
     for k, v in items:
         if v["kind"] != FREE:
             continue
         print(f"  {k:<{width}}  {v['what']}   [{v['basis']}]")
     paid = [(k, v) for k, v in items if v["kind"] != FREE]
     if paid:
-        print("\nCOSTS CREDITS — 1 per record, and this CLI will not run them without --yes\n")
+        print("\nCOSTS CREDITS. 1 per record, and this CLI will not run them without --yes\n")
         for k, v in paid:
             print(f"  {k:<{width}}  {v['what']}   [{v['basis']}]")
     print("\nNotes:")
@@ -279,8 +278,8 @@ def check_payload(payload):
     bulk_reveal_person_emails answers {"success": false, "code": "rate_limited",
     "error": "... Retry in 36s."} with a 200 status, so a client that only looks
     at HTTP codes records a throttled chunk as a success and silently drops
-    every record in it. Rate limits are per tool bucket — search is not
-    throttled, enrichment is — so this only shows up under real volume.
+    every record in it. Rate limits are per tool bucket, search is not
+    throttled, enrichment is, so this only shows up under real volume.
     """
     if not isinstance(payload, dict) or payload.get("success") is not False:
         return payload
@@ -304,7 +303,7 @@ def _confirm(key: str, units: int, yes: bool) -> None:
     """Refuse to spend credits unless explicitly allowed."""
     cost = estimate(key, units)
     if cost == 0:
-        sys.stderr.write(f"{key}: free — {units:,} records, 0 credits\n")
+        sys.stderr.write(f"{key}: free, {units:,} records, 0 credits\n")
         return
     if yes or os.environ.get("FIRMABLE_ASSUME_YES") == "1":
         sys.stderr.write(f"{key}: spending up to {cost:,} credits for {units:,} records\n")
@@ -319,7 +318,7 @@ def _confirm(key: str, units: int, yes: bool) -> None:
                       f"    but  {alt['caveat']}"]
     lines += ["",
               "  If you do want to spend, re-run with --yes (or FIRMABLE_ASSUME_YES=1 for",
-              "  unattended runs — bound it with --limit first).",
+              "  unattended runs, bound it with --limit first).",
               "  `firmable costs` lists everything that is free."]
     sys.exit("\n".join(lines))
 
@@ -412,7 +411,7 @@ def run_chunked(ids: list[str], tool: str, build_args, out_path: Path,
                 payload = fut.result()
                 rec = {"_ids": batch, "_ok": True, "data": payload}
                 counts["ok"] += len(batch)
-            except Exception as e:  # noqa: BLE001 — one bad chunk must not kill the run
+            except Exception as e:  # noqa: BLE001, one bad chunk must not kill the run
                 rec = {"_ids": batch, "_ok": False, "_error": str(e)[:400]}
                 counts["err"] += len(batch)
             with lock:
@@ -428,7 +427,7 @@ def run_chunked(ids: list[str], tool: str, build_args, out_path: Path,
 
 
 # ---------------------------------------------------------------------------
-# search — FREE
+# search. FREE
 # ---------------------------------------------------------------------------
 
 SEARCH_COLUMNS = [
@@ -464,7 +463,7 @@ def flatten_hit(rec: dict) -> dict:
 def cmd_search(argv: list[str]) -> None:
     p = argparse.ArgumentParser(
         prog="firmable search",
-        description="Discovery across Firmable. FREE — search never costs credits, so page freely.",
+        description="Discovery across Firmable. FREE, search never costs credits, so page freely.",
     )
     p.add_argument("--query", help="Natural language (uses ai_search)")
     p.add_argument("--filters", help="Structured filters as JSON (uses filter_search)")
@@ -491,7 +490,7 @@ def cmd_search(argv: list[str]) -> None:
     limiter = _Limiter(args.rps)
 
     tool = "ai_search" if args.query else "filter_search"
-    sys.stderr.write(f"{tool}: free — searching costs no credits\n")
+    sys.stderr.write(f"{tool}: free, searching costs no credits\n")
 
     records: list = []
     offset = 0
@@ -539,7 +538,7 @@ def cmd_search(argv: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# emails — FREE, 100 per call
+# emails. FREE, 100 per call
 # ---------------------------------------------------------------------------
 
 EMAIL_COLUMNS = ["person_id", "name", "work_email", "personal_email",
@@ -554,7 +553,7 @@ def _emails_of(rec: dict, kind: str) -> list[dict]:
 def cmd_emails(argv: list[str]) -> None:
     p = argparse.ArgumentParser(
         prog="firmable emails",
-        description="Work + personal emails for many people. FREE — 100 per call, no credits.",
+        description="Work + personal emails for many people. FREE. 100 per call, no credits.",
     )
     p.add_argument("input", nargs="?", help="CSV/text file of person ids (- for stdin)")
     p.add_argument("--ids", help="Comma-separated person ids instead of a file")
@@ -608,13 +607,13 @@ def cmd_emails(argv: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# profiles / phones — THESE SPEND CREDITS
+# profiles / phones. THESE SPEND CREDITS
 # ---------------------------------------------------------------------------
 
 def cmd_profiles(argv: list[str]) -> None:
     p = argparse.ArgumentParser(
         prog="firmable profiles",
-        description="Full person profiles — email AND phone AND firmographics. "
+        description="Full person profiles, email AND phone AND firmographics. "
                     "COSTS 1 CREDIT PER PERSON. Needs --yes.",
     )
     p.add_argument("input", nargs="?", help="CSV/text file of person ids (- for stdin)")
@@ -626,7 +625,7 @@ def cmd_profiles(argv: list[str]) -> None:
     p.add_argument("--out", help="JSONL output path")
     p.add_argument("--rps", type=float, default=DEFAULT_RPS)
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
-    p.add_argument("--limit", type=int, help="Only take the first N ids — bound the spend")
+    p.add_argument("--limit", type=int, help="Only take the first N ids, bound the spend")
     p.add_argument("--yes", action="store_true", help="Confirm the credit spend")
     p.add_argument("--force", action="store_true", help="Ignore the resume file")
     p.add_argument("--verbose", action="store_true")
@@ -653,7 +652,7 @@ def cmd_phones(argv: list[str]) -> None:
     p = argparse.ArgumentParser(
         prog="firmable phones",
         description="Mobile numbers for many people. COSTS 1 CREDIT PER PERSON, and the "
-                    "underlying call is ATOMIC — a chunk larger than your balance is rejected "
+                    "underlying call is ATOMIC, a chunk larger than your balance is rejected "
                     "whole. Needs --yes. Consider `firmable profiles` instead: same price, but "
                     "it returns the profile and email too.",
     )
@@ -664,7 +663,7 @@ def cmd_phones(argv: list[str]) -> None:
     p.add_argument("--out", help="JSONL output path")
     p.add_argument("--rps", type=float, default=DEFAULT_RPS)
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
-    p.add_argument("--limit", type=int, help="Only take the first N ids — bound the spend")
+    p.add_argument("--limit", type=int, help="Only take the first N ids, bound the spend")
     p.add_argument("--yes", action="store_true", help="Confirm the credit spend")
     p.add_argument("--force", action="store_true", help="Ignore the resume file")
     p.add_argument("--verbose", action="store_true")

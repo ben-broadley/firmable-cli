@@ -1,9 +1,11 @@
-# Working with Firmable — read this before you spend anything
+# Working with Firmable: read this before you spend anything
 
 You are about to query Firmable. Most of what you need is **free**, and the paid
-endpoints are the ones an agent reaches for first out of habit. This file exists
-because that has already happened here: a session burned ~20 credits on REST
-company lookups after correctly printing a table showing search was free.
+endpoints are the ones an agent reaches for first, because they are the obvious
+ones: they have clear names, they take the identifier you already hold, and they
+return a whole record. The free routes are less discoverable and need a step of
+indirection. Reading the cost table is not enough on its own. The habit wins
+unless you check before each call.
 
 Run `firmable costs --json` for the machine-readable contract. This file is the
 reasoning around it.
@@ -28,9 +30,9 @@ That is the whole model. Everything below follows from it.
 
 1. **Do you need a record at all, or just to know it exists?** Free search
    returns `has_email`, `has_mobile`, `has_dnd_phone` per person. That is often
-   the answer on its own — you can size an account, count contactable people, and
+   the answer on its own. You can size an account, count contactable people, and
    filter out DNC-listed numbers without spending anything.
-2. **Do you need emails?** Free. `firmable emails` — 100 per call, no charge.
+2. **Do you need emails?** Free. `firmable emails` does 100 per call, no charge.
    Never use REST `/people` for this; it charges a credit for a record carrying
    the same address.
 3. **Do you need a mobile?** This is the only thing worth paying for. Qualify
@@ -42,43 +44,49 @@ That is the whole model. Everything below follows from it.
 
 ## Free recipes
 
-**Company from a domain — free, but indirect.** There is *no* domain, website,
+**Company from a domain: free, but indirect.** There is *no* domain, website,
 `fqdn` or company-name filter in `filter_search`; the only identifier filters are
-`company_id` and `person_id`. And `ai_search` on a bare domain returns nonsense
-(`"bamlabs.ai"` returned Commonwealth Bank). What works is searching the company
-**name** and verifying the `fqdn` that comes back:
+`company_id` and `person_id`. And `ai_search` does not understand domains. It
+matches them as text and returns whatever is prominent:
 
 ```bash
-firmable mcp call ai_search --arg query="BamLabs" --arg category=company --arg country=AU
-# -> f000562417551 | BamLabs | https://bamlabs.ai   <- match this fqdn to your domain
+firmable mcp call ai_search --arg query="smec.com" --arg category=company
+# -> Commonwealth Bank | Queensland Health | NAB        <- useless
+
+firmable mcp call ai_search --arg query="SMEC" --arg category=company
+# -> f000000147616 | SMEC | http://www.smec.com         <- match this fqdn
+#    SMEC Power & Technology | smecpt.com.au
+#    SMEC Testing Services   | smectesting.com.au
 ```
 
-Name search is fuzzy — `"Heidi Health"` returns the right company first, then two
-unrelated Heidis. **Always confirm on `fqdn` before using the id.** Only fall back
-to a paid `get_company --arg domain=...` when no result's `fqdn` matches.
+Search the **name**, then confirm the returned `fqdn` matches the domain you were
+given. Note the second and third results above: near-name subsidiaries with
+different domains. Taking the first hit without checking `fqdn` silently attaches
+your contacts to the wrong entity. Only fall back to a paid
+`get_company --arg domain=...` when nothing matches.
 
-**Everyone at a company — free.**
+**Everyone at a company, free.**
 
 ```bash
-firmable people-search --company-id f000562417551 --all --csv people.csv
+firmable people-search --company-id f000000147616 --all --csv people.csv
 ```
 
 Paging is free too. Returns name, position, LinkedIn and the `has_*` flags.
 
-**Their emails — free.**
+**Their emails, free.**
 
 ```bash
 firmable emails people.csv --csv contacts.csv
 ```
 
-**Their mobiles — this spends.** Filter to the qualified subset first, then:
+**Their mobiles. This is the part that spends.** Filter to the qualified subset first, then:
 
 ```bash
 firmable phones qualified.csv --csv mobiles.csv --limit 200 --yes
 ```
 
 `--yes` is required. Without it the command refuses and tells you the maximum
-spend. `FIRMABLE_ASSUME_YES=1` unblocks it for unattended runs — set that only
+spend. `FIRMABLE_ASSUME_YES=1` unblocks it for unattended runs. Set that only
 when the spend is already bounded by `--limit`.
 
 ## Rate limits
@@ -99,18 +107,18 @@ body:
 ```
 
 A client that only checks HTTP status records this as a **success and silently
-drops every record in the chunk**. That is exactly what happened here on a first
-run: 250 people in, 200 rows out, nothing flagged. `firmable emails` now detects
-it and honours the retry hint, so use these commands rather than rolling your own
-loop over `firmable mcp call`.
+drops every record in the chunk**. 250 ids in, 200 rows out, nothing raised.
+`firmable emails` and `firmable phones` inspect the body and honour the retry
+hint, which is the reason to use them rather than rolling your own loop over
+`firmable mcp call`.
 
-Defaults are 5 req/s over 4 workers — deliberately below what the server allows.
+Defaults are 5 req/s over 4 workers, well below what the server allows.
 Sustained load from a named account invites a limit being imposed. The bulk tools
 take 100 records per call, so a slow request rate still moves plenty.
 
 ## Things that will catch you out
 
-- **No balance endpoint.** You cannot check credits programmatically — not on
+- **No balance endpoint.** You cannot check credits programmatically. Not on
   REST, not among the 28 MCP tools, not in any response header. Bound runs up
   front with `--limit`; you discover exhaustion by failing.
 - **`bulk_reveal_person_phones` is atomic.** A batch larger than the remaining
@@ -118,7 +126,7 @@ take 100 records per call, so a slow request rate still moves plenty.
 - **Credit-charging MCP tools have no server-side approval gate.** They run the
   moment you call them. This CLI adds the gate; `firmable mcp call` does not.
 - **A REST miss returns HTTP 500**, not 404. Retrying it wastes five calls.
-- **The app's "Credit used" figure is wrong** — it under-reports by a constant
+- **The app's "Credit used" figure is wrong.** It under-reports by a constant
   offset. Read "Credits remaining".
 
 ## Verification status
@@ -126,5 +134,5 @@ take 100 records per call, so a slow request rate still moves plenty.
 Costs marked `measured` in `firmable costs` were spent against a live balance one
 action at a time on 2026-08-21, with a positive control. Those marked `declared`
 are Firmable's own tool descriptions and have not been independently confirmed.
-Do not treat `declared` as proven — if you are about to spend real volume on one,
+Do not treat `declared` as proven. If you are about to spend real volume on one,
 test a single call against the balance first.

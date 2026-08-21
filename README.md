@@ -7,26 +7,32 @@ NZBNs, ANZSIC codes, technographics, work emails, mobile numbers and Do Not Call
 Unofficial. Not affiliated with, endorsed by, or sponsored by Firmable.
 
 ```bash
-firmable company --fqdn canva.com
-firmable people-search --company-id f000000117274 --seniority C-Suite --all
-firmable company-batch domains.csv --by fqdn --csv enriched.csv
-firmable mcp call company_search --arg query="physiotherapy clinics in Victoria"
+firmable costs                                    # what spends, and what does not
+firmable search --query "physio clinics in Melbourne" --csv companies.csv   # free
+firmable people-search --company-id f000000147616 --all --csv people.csv    # free
+firmable emails people.csv --csv contacts.csv                               # free
+firmable phones people.csv --csv mobiles.csv --limit 200 --yes              # 1 credit each
 ```
 
-Two files and a spec. No dependencies, Python 3.9 or newer.
+No dependencies, Python 3.9 or newer.
 
+- **Free discovery and free work emails.** Searching costs nothing on either surface, and
+  `bulk_reveal_person_emails` returns unmasked work addresses 100 at a time for nothing.
+  Mobile numbers are the only thing you really pay for.
+- **A cost model you can query.** `firmable costs --json` publishes what each operation
+  costs, which numbers were measured rather than quoted, and the free alternative to each
+  paid call. Commands that spend refuse to run without `--yes`.
 - **Every documented REST operation**, with flags and help text generated from Firmable's
-  own `openapi.json`.
-- **Batch enrichment.** Point it at a CSV column, get back a flattened CSV. Rate limited,
-  resumable, and it will not re-buy a row you already paid for.
+  own `openapi.json`, plus resumable batch enrichment from a CSV column.
 - **MCP from the shell.** Firmable's MCP server normally only answers to Claude, ChatGPT or
-  Cursor. `firmable mcp` speaks the protocol directly, so the same tools work in a terminal,
+  Cursor. `firmable mcp` speaks the protocol directly, so all 28 tools work in a terminal,
   a cron job, or anything that can shell out.
 
 > **Agents: read [AGENTS.md](AGENTS.md) first, or run `firmable costs --json`.**
-> Searching is free and only record retrieval spends. The paid endpoints are the
-> ones you will reach for out of habit — a session here burned ~20 credits on REST
-> company lookups right after printing the table showing search was free.
+> Searching is free; only record retrieval spends. The paid endpoints are the
+> discoverable ones. They take the identifier you already hold and return a whole
+> record, while the free routes need a step of indirection. It is easy to spend
+> credits answering a question search would have answered for nothing.
 
 ## Which half should I use?
 
@@ -109,7 +115,7 @@ already in it. Kill a job halfway through a 40,000-row list and start it again; 
 where it stopped and you pay for nothing twice. `--force` overrides.
 
 **It only charges for records.** One credit per row that hits, nothing for a miss, nothing for
-the searching. `roster` lists everyone at a company for free — only `--enrich` spends, at one
+the searching. `roster` lists everyone at a company for free. Only `--enrich` spends, at one
 credit per person, so `--only-contactable` is doing real work.
 
 **It stays inside the rate limit.** Firmable allows 50 requests per second per key. The
@@ -186,7 +192,7 @@ full schemas; the summary:
 | **Discovery** | `ai_search`, `filter_search`, `get_filter_options`, `list_saved_searches` | **free** |
 | **Lookalikes** | `find_similar_companies`, `find_similar_people` | free |
 | **Profiles** | `get_company`, `get_person`, `bulk_get_companies`, `bulk_get_people` | 1 credit each, free on repeat |
-| **Emails** | `reveal_person_email`, `bulk_reveal_person_emails` | **free — not credit-gated** |
+| **Emails** | `reveal_person_email`, `bulk_reveal_person_emails` | **free, not credit-gated** |
 | **Phones** | `reveal_person_phone`, `bulk_reveal_person_phones` | 1 credit each |
 | **Lists** | `list_lists`, `get_list`, `create_list`, `rename_list`, add / remove / copy / move | free |
 | **Signals** | `list_signal_agents`, `get_signal_agent`, `agent_signal_hits` | free |
@@ -194,15 +200,22 @@ full schemas; the summary:
 
 Three things stand out.
 
-**Search exists.** The REST API cannot find anything — every endpoint needs an identifier you
+**Search exists.** The REST API cannot find anything. Every endpoint needs an identifier you
 already hold. `filter_search` and `ai_search` do actual discovery, by industry, location, size,
 revenue, seniority, technographics or contact availability, and both are free. Their own
 guidance is to prefer `filter_search`: it is more precise, and `ai_search` runs heavy
 natural-language parsing server-side. Resolve option ids with `get_filter_options` first rather
 than guessing them.
 
-**Emails are free here.** `reveal_person_email` and `bulk_reveal_person_emails` cost nothing —
-confirmed against a live balance — where the REST `/people` endpoint charges a credit for a
+One gap worth knowing: **nothing searches by domain.** `filter_search` has no domain, website or
+company-name filter. Its only identifier filters are `company_id` and `person_id`, and
+`ai_search` treats a domain as text, so `"smec.com"` returns Commonwealth Bank and NAB. To turn a
+domain into a company id for free, search the company *name* and confirm the `fqdn` that comes
+back. Watch for near-name subsidiaries: `"SMEC"` also returns SMEC Power & Technology and SMEC
+Testing Services, on different domains.
+
+**Emails are free here.** `reveal_person_email` and `bulk_reveal_person_emails` cost nothing,
+confirmed against a live balance, where the REST `/people` endpoint charges a credit for a
 record containing the same address. If you want work emails at volume, this is the cheaper path
 by a wide margin. Phones still cost a credit either way.
 
@@ -213,7 +226,7 @@ alongside `is_dnd`, so you can separate mobiles from landlines. REST gives you n
 per call. The REST batch commands in this CLI issue one HTTP request per row because that is all
 the REST API offers.
 
-Those costs are measured, not quoted — see [Credits](#credits). Firmable draws them from
+Those costs are measured rather than quoted. See [Credits](#credits). Firmable draws them from
 separate pools (`api_enrichment`, `people_phone_viewed`, `crm_push`), so a phone budget and an
 enrichment budget run down independently.
 
@@ -254,7 +267,7 @@ disagree with each other, so these are observed numbers rather than quoted ones.
 
 | Action | Cost |
 | --- | --- |
-| **Any search** — REST `people-search`, MCP `filter_search` / `ai_search` | **free** |
+| **Any search**: REST `people-search`, MCP `filter_search` / `ai_search` | **free** |
 | MCP `reveal_person_email` / `bulk_reveal_person_emails` | **free** |
 | MCP list, signal and filter-option tools | free |
 | REST `company` / `people` that hits | 1 |
@@ -299,10 +312,10 @@ Limits are **per tool bucket**, and they are not uniform:
 ```
 
 A client that only checks the HTTP status records that as a success and **silently
-drops every record in the chunk**. That happened on the first run here — 250 people
-in, 200 rows out, nothing flagged. `firmable emails` and `firmable phones` detect it
-and honour the retry hint, which is the main reason to use them rather than looping
-over `firmable mcp call` yourself.
+drops every record in the chunk**. 250 ids in, 200 rows out, nothing raised.
+`firmable emails` and `firmable phones` inspect the body and honour the retry hint,
+which is the main reason to use them rather than looping over `firmable mcp call`
+yourself.
 
 Defaults are 5 req/s over 4 workers, deliberately below what the server permits.
 Sustained load from a named account is how you get a limit imposed. Since the bulk
@@ -311,14 +324,14 @@ tools take 100 records per call, a slow request rate still moves plenty.
 ### You cannot read your balance programmatically
 
 There is no credits endpoint on the REST API, no usage tool among the 28 MCP tools, and no
-usage metadata on any response — REST returns no credit headers, and the MCP envelope carries
+usage metadata on any response. REST returns no credit headers, and the MCP envelope carries
 only `content`, `structuredContent` and `isError`. The only place a balance appears is the
 Firmable web app.
 
 Two consequences if you are scripting this:
 
-- **A run cannot check its own budget before spending.** Bound it up front instead — `--limit`,
-  `--per-company`, `--only-contactable` — rather than expecting it to stop itself.
+- **A run cannot check its own budget before spending.** Bound it up front with `--limit`,
+  `--per-company` or `--only-contactable`, rather than expecting it to stop itself.
 - **You find out you are empty by failing.** Phone reveals return `code="no_credits"`, and
   `bulk_reveal_person_phones` is atomic, so a batch larger than the remaining balance is
   rejected whole rather than partially filled. Handle that error rather than assuming a partial

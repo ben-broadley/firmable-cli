@@ -1,9 +1,9 @@
-"""firmable mcp — drive the Firmable MCP server from the shell.
+"""firmable mcp: drive the Firmable MCP server from the shell.
 
-Firmable ships an MCP server (agents.firmable.com/mcp) with 28 tools — a much
+Firmable ships an MCP server (agents.firmable.com/mcp) with 28 tools, a much
 larger surface than the three documented REST endpoints. Normally you would only
 reach it from inside an MCP client (Claude, ChatGPT, Cursor). This module speaks
-the protocol directly — Streamable HTTP + JSON-RPC — so the same tools are
+the protocol directly. Streamable HTTP + JSON-RPC, so the same tools are
 available from a terminal, a cron job, or any script that can shell out.
 
 Why it beats the REST API for most work:
@@ -24,13 +24,13 @@ So: search free -> reveal emails free -> spend only on phones. If you do need a
 phone, prefer get_person over reveal_person_phone: same one credit, but it
 returns the profile and email too.
 
-Call get_workflow_guide first in a session — it documents the intended chain
+Call get_workflow_guide first in a session, it documents the intended chain
 (get_* -> find_similar_* -> bulk_* -> reveal_*) and the filter encoding rules,
 which are fiddly enough that guessing them wastes calls. Prefer filter_search
 over ai_search; the latter parses loosely.
 
 Credit-charging tools run IMMEDIATELY with no in-tool approval gate, and
-bulk_reveal_person_phones is atomic — a batch larger than the balance is
+bulk_reveal_person_phones is atomic, a batch larger than the balance is
 rejected whole rather than partially filled.
 
     firmable mcp login              # one-time browser sign-in (OAuth 2.1 + PKCE)
@@ -171,7 +171,7 @@ def _form_post(url: str, fields: dict, timeout: int = 30) -> dict:
 class _CallbackHandler(http.server.BaseHTTPRequestHandler):
     captured: dict = {}
 
-    def do_GET(self):  # noqa: N802 — stdlib naming
+    def do_GET(self):  # noqa: N802, stdlib naming
         parsed = urllib.parse.urlsplit(self.path)
         params = dict(urllib.parse.parse_qsl(parsed.query))
         _CallbackHandler.captured = params
@@ -218,7 +218,7 @@ def do_login(args) -> None:
     except OSError as e:
         raise McpError(
             f"cannot listen on 127.0.0.1:{args.port} ({e}).\n"
-            f"  Port {CALLBACK_PORT} is the one Firmable registers for this client ID — "
+            f"  Port {CALLBACK_PORT} is the one Firmable registers for this client ID, "
             "free it up, or pass --port if you registered another."
         )
     server.timeout = 1
@@ -239,7 +239,7 @@ def do_login(args) -> None:
     if params.get("error"):
         raise McpError(f"authorization failed: {params.get('error_description') or params['error']}")
     if params.get("state") != state:
-        raise McpError("state mismatch on the callback — aborting")
+        raise McpError("state mismatch on the callback, aborting")
 
     payload = _form_post(meta["token_endpoint"], {
         "grant_type": "authorization_code",
@@ -252,7 +252,7 @@ def do_login(args) -> None:
     _store(payload, args.client_id, meta)
     print(f"Signed in. Tokens cached in {TOKEN_PATH} (0600).")
     if not payload.get("refresh_token"):
-        print("Note: no refresh token returned — you'll need to re-run `login` when this expires.")
+        print("Note: no refresh token returned, you'll need to re-run `login` when this expires.")
 
 
 def _store(payload: dict, client_id: str, meta: dict) -> dict:
@@ -273,7 +273,7 @@ def _store(payload: dict, client_id: str, meta: dict) -> dict:
 
 def refresh(tokens: dict) -> dict:
     if not tokens.get("refresh_token"):
-        raise McpError("access token expired and no refresh token cached — run: firmable mcp login")
+        raise McpError("access token expired and no refresh token cached, run: firmable mcp login")
     payload = _form_post(tokens.get("token_endpoint") or FALLBACK_AS["token_endpoint"], {
         "grant_type": "refresh_token",
         "refresh_token": tokens["refresh_token"],
@@ -287,7 +287,7 @@ def refresh(tokens: dict) -> dict:
 def access_token(allow_refresh: bool = True) -> str:
     tokens = load_tokens()
     if not tokens.get("access_token"):
-        raise McpError("not signed in — run: firmable mcp login")
+        raise McpError("not signed in, run: firmable mcp login")
     if allow_refresh and tokens.get("expires_at", 0) - 60 < time.time():
         tokens = refresh(tokens)
     return tokens["access_token"]
@@ -364,7 +364,7 @@ class McpSession:
                 self._token = refresh(load_tokens())["access_token"]
                 return self._post(payload, retry_auth=False)
             if e.code == 404 and self.session_id:
-                # Server dropped the session — start a fresh one and replay.
+                # Server dropped the session, start a fresh one and replay.
                 self.session_id, self._initialized = None, False
                 self.initialize()
                 return self._post(payload, retry_auth=False)
@@ -480,7 +480,7 @@ def do_status(_args) -> None:
     print(f"client id           : {tokens.get('client_id')}")
     print(f"scope               : {tokens.get('scope')}")
     print(f"access token expires: {'in %d min' % (left // 60) if left > 0 else 'expired'}")
-    print(f"refresh token       : {'cached' if tokens.get('refresh_token') else 'none — re-login when expired'}")
+    print(f"refresh token       : {'cached' if tokens.get('refresh_token') else 'none, re-login when expired'}")
     print(f"token file          : {TOKEN_PATH}")
 
 
@@ -567,7 +567,7 @@ def main(argv: list[str]) -> None:
     p = sub.add_parser("login", help="Browser sign-in (OAuth 2.1 + PKCE)")
     p.add_argument("--client-id", default=CLIENT_ID, help=f"OAuth client id (default {CLIENT_ID})")
     p.add_argument("--port", type=int, default=CALLBACK_PORT,
-                   help=f"Loopback callback port (default {CALLBACK_PORT} — the one Firmable registers)")
+                   help=f"Loopback callback port (default {CALLBACK_PORT}, the one Firmable registers)")
     p.add_argument("--timeout", type=int, default=300, help="Seconds to wait for the callback")
     p.add_argument("--no-browser", action="store_true", help="Print the URL instead of opening it")
     p.set_defaults(func=do_login)

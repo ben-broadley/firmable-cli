@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""firmable — unofficial CLI over the Firmable REST API.
+"""firmable: an unofficial CLI over the Firmable REST API.
 
 Not affiliated with, endorsed by, or sponsored by Firmable.
 
@@ -39,7 +39,7 @@ Only record retrieval costs anything. Searching is free, so use people-search
 freely to size and qualify a company before spending on the people in it.
 
 Batch commands resume from their JSONL output by default, so a re-run never
-re-buys a row you already have — pass --force to override. --dry-run prints the
+re-buys a row you already have, pass --force to override. --dry-run prints the
 request without sending it.
 
 Where the spec lies (handled here, so you don't have to):
@@ -108,7 +108,7 @@ class ApiError(Exception):
 
 
 class AuthError(ApiError):
-    """The API key was rejected — never worth retrying, and fatal in batch."""
+    """The API key was rejected. Never worth retrying, and fatal in batch."""
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +261,7 @@ def http_request(
     retries: int = 4,
     timeout: int = 60,
 ) -> object:
-    """Single HTTP entry point. Raises ApiError on failure — never exits."""
+    """Single HTTP entry point. Raises ApiError on failure, never exits."""
     qs_pairs = [(k, v) for k, v in (query or {}).items() if v is not None and v != ""]
     qs = urllib.parse.urlencode(qs_pairs, doseq=True)
     url = BASE_URL + path + (("?" + qs) if qs else "")
@@ -359,7 +359,7 @@ def resolve_api_key(required: bool = True) -> str:
 
 
 # ---------------------------------------------------------------------------
-# flattening — one record -> one flat CSV row
+# flattening, one record -> one flat CSV row
 # ---------------------------------------------------------------------------
 
 SEP = "; "
@@ -384,7 +384,7 @@ def _j(v, sep: str = SEP) -> str:
 
 
 def _emails(block, kind: str) -> list[str]:
-    """People.emails[kind] is a list of {value, deliverability} — or plain strings."""
+    """People.emails[kind] is a list of {value, deliverability}, or plain strings."""
     if not isinstance(block, dict):
         return []
     vals = block.get(kind) or []
@@ -478,7 +478,7 @@ def flatten_person(rec: dict) -> dict:
         return {}
     company = rec.get("current_company") or {}
     phones = rec.get("phones") or []
-    # is_dnd is real ACMA Do Not Call Register status — Firmable folds the register
+    # is_dnd is real ACMA Do Not Call Register status. Firmable folds the register
     # into their dataset. Split it out here so the distinction survives into a CSV
     # instead of staying buried in a nested field, and a dialler can be pointed at
     # `mobile` alone. It is the register as at Firmable's last refresh, so it is a
@@ -682,7 +682,7 @@ def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
                             help=(fschema.get("description") or "").strip())
     if name == "people-search":
         parser.add_argument("--all", action="store_true",
-                            help="Page through every match (free — search costs no credits)")
+                            help="Page through every match (free, search costs no credits)")
         parser.add_argument("--max", type=int, default=None,
                             help="Stop after this many records when using --all")
         parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
@@ -747,7 +747,7 @@ def run_endpoint(registry: dict, name: str, argv: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# batch — CSV in, JSONL + CSV out, rate limited, resumable
+# batch. CSV in, JSONL + CSV out, rate limited, resumable
 # ---------------------------------------------------------------------------
 
 def read_input_rows(path: str, column: str | None, default_column: str) -> tuple[list[dict], list[str], str]:
@@ -818,7 +818,7 @@ def run_batch(values: list[str], worker, out_path: Path, rps: float, concurrency
                 rec = {"_input": value, "_ok": True, "data": fut.result()}
                 counts["ok"] += 1
             except AuthError as e:
-                sys.stderr.write(f"\n{label}: {e} — stopping (fix {API_KEY_ENV} and re-run to resume)\n")
+                sys.stderr.write(f"\n{label}: {e}, stopping (fix {API_KEY_ENV} and re-run to resume)\n")
                 for f2 in futures:
                     f2.cancel()
                 break
@@ -826,7 +826,7 @@ def run_batch(values: list[str], worker, out_path: Path, rps: float, concurrency
                 rec = {"_input": value, "_ok": False, "_miss": e.miss,
                        "_status": e.status, "_error": e.message}
                 counts["miss" if e.miss else "err"] += 1
-            except Exception as e:  # noqa: BLE001 — one bad row must not kill the run
+            except Exception as e:  # noqa: BLE001, one bad row must not kill the run
                 rec = {"_input": value, "_ok": False, "_miss": False,
                        "_status": None, "_error": repr(e)}
                 counts["err"] += 1
@@ -922,7 +922,7 @@ def _extras(rows, chosen, keep_columns):
 
 
 def cmd_lookup_batch(argv: list[str], endpoint: str) -> None:
-    """company-batch / people-batch — one GET per input row."""
+    """company-batch / people-batch, one GET per input row."""
     choices = IDENTIFIERS[endpoint]
     default_column = "fqdn" if endpoint == "company" else "ln_url"
     args = _batch_parser(f"firmable {endpoint}-batch", default_column, choices).parse_args(argv)
@@ -958,11 +958,11 @@ def cmd_lookup_batch(argv: list[str], endpoint: str) -> None:
 
 
 def cmd_roster(argv: list[str]) -> None:
-    """roster — people/search fanned out over a CSV of Firmable company ids."""
+    """roster, people/search fanned out over a CSV of Firmable company ids."""
     p = argparse.ArgumentParser(
         prog="firmable roster",
         description="For each company id, page /people/search (free). --enrich then buys a "
-                    "full contact record for every person found (1 credit each) — bound it "
+                    "full contact record for every person found (1 credit each), bound it "
                     "with --per-company and --only-contactable.",
     )
     p.add_argument("input", help="Input CSV of Firmable company ids")
@@ -974,7 +974,7 @@ def cmd_roster(argv: list[str]) -> None:
     p.add_argument("--per-company", type=int, default=None, help="Cap people returned per company")
     p.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
     p.add_argument("--enrich", action="store_true",
-                   help="Also GET /people for each hit — full emails and mobiles, 1 credit per person")
+                   help="Also GET /people for each hit, full emails and mobiles, 1 credit per person")
     p.add_argument("--only-contactable", action="store_true",
                    help="With --enrich, only enrich people the search says have an email or mobile")
     p.add_argument("--out", help="JSONL output path")
@@ -1076,10 +1076,10 @@ BATCH_COMMANDS = {
 # spend credits without --yes.
 VOLUME_COMMANDS = {
     "costs": "what spends credits and what does not (--json for agents)",
-    "search": "find companies or people — FREE",
-    "emails": "work + personal emails, 100 per call — FREE",
-    "profiles": "full person or company profiles — COSTS 1 CREDIT EACH",
-    "phones": "mobile numbers — COSTS 1 CREDIT EACH",
+    "search": "find companies or people. FREE",
+    "emails": "work + personal emails, 100 per call. FREE",
+    "profiles": "full person or company profiles. COSTS 1 CREDIT EACH",
+    "phones": "mobile numbers. COSTS 1 CREDIT EACH",
 }
 
 
@@ -1146,12 +1146,12 @@ def main() -> None:
     if cmd == "mcp":
         # Resolve alongside the real script so a symlinked/shimmed firmable works.
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from firmable_mcp import main as mcp_main  # noqa: PLC0415 — optional module
+        from firmable_mcp import main as mcp_main  # noqa: PLC0415, optional module
         mcp_main(rest)
         return
     if cmd in VOLUME_COMMANDS:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import firmable_bulk  # noqa: PLC0415 — optional module
+        import firmable_bulk  # noqa: PLC0415, optional module
         getattr(firmable_bulk, f"cmd_{cmd}")(rest)
         return
     if cmd in registry:
