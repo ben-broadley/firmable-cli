@@ -84,6 +84,9 @@ firmable roster companies.csv --enrich --only-contactable --csv people.csv
 already in it. Kill a job halfway through a 40,000-row list and start it again; it picks up
 where it stopped and you pay for nothing twice. `--force` overrides.
 
+**It costs what you'd expect.** One credit per row that hits, nothing for a miss. `roster` is
+the exception — see [Credits](#credits) before pointing it at large companies.
+
 **It stays inside the rate limit.** Firmable allows 50 requests per second per key. The
 default is 20 across 8 threads, tunable with `--rps` and `--concurrency`, and the CLI refuses
 to go above 50.
@@ -171,10 +174,30 @@ callback port from Firmable's own documentation instead.
 
 ## Credits
 
-Successful lookups spend Firmable credits, so the CLI is built to avoid spending them twice.
-Batch commands resume by default. `roster --enrich` buys one extra lookup per person it finds,
-which adds up quickly on large companies, so bound it with `--per-company` and
-`--only-contactable`. `--dry-run` costs nothing.
+| Action | Cost |
+| --- | --- |
+| `company` / `people` lookup that hits | 1 credit |
+| `people-search` | **1 credit per call** |
+| lookup that misses | 0 |
+| re-fetching a record you already bought | 0 |
+| `--dry-run`, `help`, `commands` | 0 |
+
+**`people-search` bills per call, not per record.** This is the one that catches people out.
+A single call returning 200 people costs the same as one returning 2, so paging is what costs
+you: `--all` over 2,000 people at the default page size is 20 calls and 20 credits. Pull the
+biggest page you can rather than walking small ones.
+
+```bash
+firmable people-search --company-id X --all --page-size 200   # cheaper
+firmable people-search --company-id X --all --page-size 10    # 20x the calls
+```
+
+`roster` inherits this. Listing everyone at a 1,600-person company is around 16 credits before
+you enrich anybody, and `--enrich` then buys one lookup per person on top. Bound both ends with
+`--per-company` and `--only-contactable`.
+
+Batch commands resume from their JSONL by default, so an interrupted run never re-buys a row.
+That is the main defence against paying twice, and `--force` is the only way to override it.
 
 ## Licence
 
